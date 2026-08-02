@@ -39,7 +39,7 @@ def _provider_pip_dependencies(provider_name: str, declared: list) -> list:
             mode = cfg.get("mode", "")
             # "local" is a legacy alias for "local_embedded"
             if mode in {"local", "local_embedded"}:
-                deps.append("hindsight-all")
+                deps.append("hindsight-all==0.8.6")
         except Exception:
             pass
     return deps

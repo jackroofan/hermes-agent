@@ -18,6 +18,7 @@ def test_hindsight_is_declared():
         "api_url",
         "bank_id",
         "recall_budget",
+        "route_policy",
     }
 
 

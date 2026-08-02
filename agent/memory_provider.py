@@ -80,6 +80,11 @@ class MemoryProvider(ABC):
           - parent_session_id (str): For subagents, the parent's session_id.
           - user_id (str): Platform user identifier (gateway sessions).
           - user_id_alt (str): Optional alternate stable platform user identifier.
+          - route_context (dict): Trusted host/session routing metadata. When
+            available this contains the current cwd plus the exact first-class
+            Project id/slug resolved by the host. Providers must never infer
+            project identity from message text, summaries, recalled content,
+            or model output.
         """
 
     def system_prompt_block(self) -> str:

@@ -1697,6 +1697,7 @@ def init_agent(
                     if agent._gateway_session_key:
                         _init_kwargs["gateway_session_key"] = agent._gateway_session_key
                     # Profile identity for per-profile provider scoping
+                    _profile = ""
                     try:
                         from hermes_cli.profiles import get_active_profile_name
                         _profile = get_active_profile_name()
@@ -1704,6 +1705,70 @@ def init_agent(
                         _init_kwargs["agent_workspace"] = "hermes"
                     except Exception:
                         pass
+                    # Trusted memory routing metadata. Project identity is
+                    # resolved exclusively from the first-class Project store
+                    # against host/session cwd metadata; message text and
+                    # recalled context never participate. The cwd is included
+                    # so a provider may match an explicitly configured project
+                    # route when a registered task worktree lives outside the
+                    # Project's primary folder.
+                    try:
+                        from agent.runtime_cwd import resolve_agent_cwd
+
+                        _route_cwd = str(resolve_agent_cwd())
+                        _route_source = "runtime_cwd"
+                        _session_meta = None
+                        if agent._session_db:
+                            try:
+                                _session_meta = agent._session_db.get_session(
+                                    agent.session_id
+                                )
+                            except Exception:
+                                _session_meta = None
+                        if isinstance(_session_meta, dict):
+                            _stored_cwd = str(_session_meta.get("cwd") or "").strip()
+                            if _stored_cwd:
+                                _route_cwd = _stored_cwd
+                                _route_source = "session_metadata"
+
+                        _route_context = {
+                            "cwd": _route_cwd,
+                            "profile": _profile,
+                            "platform": platform or "cli",
+                            "session_id": agent.session_id or "",
+                            "chat_id": agent._chat_id or "",
+                            "thread_id": agent._thread_id or "",
+                            "source": _route_source,
+                        }
+                        from hermes_cli import projects_db as _projects_db
+
+                        _project = None
+                        if _projects_db.projects_db_path().exists():
+                            with _projects_db.connect_closing() as _project_conn:
+                                _project = _projects_db.project_for_path(
+                                    _project_conn, _route_cwd
+                                )
+                                if _project is None and isinstance(_session_meta, dict):
+                                    _repo_root = str(
+                                        _session_meta.get("git_repo_root") or ""
+                                    ).strip()
+                                    if _repo_root:
+                                        _project = _projects_db.project_for_path(
+                                            _project_conn, _repo_root
+                                        )
+                        if _project is not None:
+                            _route_context.update({
+                                "project_id": _project.id,
+                                "project_slug": _project.slug,
+                                "project_name": _project.name,
+                                "project_source": "projects_db",
+                            })
+                        _init_kwargs["route_context"] = _route_context
+                    except Exception:
+                        _ra().logger.debug(
+                            "Memory route context resolution failed; using provider fallback",
+                            exc_info=True,
+                        )
                     agent._memory_manager.initialize_all(**_init_kwargs)
                     _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
                 else:

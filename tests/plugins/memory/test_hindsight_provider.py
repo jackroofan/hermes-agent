@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from uuid import UUID
 
 import pytest
 
@@ -22,6 +23,7 @@ from plugins.memory.hindsight import (
     RECALL_SCHEMA,
     REFLECT_SCHEMA,
     RETAIN_SCHEMA,
+    _build_automatic_retain_operation_id,
     _load_config,
     _load_simple_env,
     _build_embedded_profile_env,
@@ -89,6 +91,15 @@ def _make_mock_client():
     client.aretain_batch = AsyncMock()
     client.aclose = AsyncMock()
     return client
+
+
+def _memory_result(text, tags, *, result_id=None):
+    return SimpleNamespace(
+        id=result_id or text,
+        text=text,
+        tags=list(tags),
+        scores=SimpleNamespace(final=1.0),
+    )
 
 
 def _provider_for_mode(tmp_path, monkeypatch, mode: str):
@@ -502,6 +513,366 @@ class TestPrefetch:
         assert p._prefetch_thread is None
 
 
+class TestProjectRouteGovernance:
+    PROJECT = "hermes-agent-engineering"
+    PROJECT_TAG = f"project:{PROJECT}"
+
+    def _project_provider(self, provider_with_config, **route_overrides):
+        route = {
+            "max_results": 2,
+            "exclude_tags": ["governance:noise"],
+            **route_overrides,
+        }
+        p = provider_with_config(
+            route_policy={"projects": {self.PROJECT: route}}
+        )
+        p.initialize(
+            session_id="project-session",
+            platform="cli",
+            agent_identity="coding",
+            hermes_home=p._hermes_home,
+            route_context={
+                "project_id": "p_hermes",
+                "project_slug": self.PROJECT,
+                "project_name": "Hermes Agent Engineering",
+                "project_source": "projects_db",
+                "profile": "coding",
+                "session_id": "project-session",
+                "cwd": "/workspace/hermes-agent",
+            },
+        )
+        p._client = _make_mock_client()
+        return p
+
+    def test_project_route_prefers_anchor_and_excludes_other_scopes(
+        self, provider_with_config
+    ):
+        p = self._project_provider(provider_with_config)
+        anchor = _memory_result(
+            "canonical project anchor",
+            [self.PROJECT_TAG, "memory:project-anchor"],
+            result_id="anchor",
+        )
+        ordinary = _memory_result(
+            "ordinary project observation",
+            [self.PROJECT_TAG, "memory:session-observation"],
+            result_id="ordinary",
+        )
+        profile_only = _memory_result(
+            "broad profile history", ["profile:coding"], result_id="profile"
+        )
+        other_project = _memory_result(
+            "other project", ["project:unrelated"], result_id="other"
+        )
+        other_domain = _memory_result(
+            "unrelated business domain",
+            [self.PROJECT_TAG, "domain:sales"],
+            result_id="domain",
+        )
+        noisy = _memory_result(
+            "old governance chatter",
+            [self.PROJECT_TAG, "governance:noise"],
+            result_id="noise",
+        )
+        def recalled_for_scope(**kwargs):
+            tags = set(kwargs.get("tags") or [])
+            if "memory:project-anchor" in tags:
+                return SimpleNamespace(
+                    results=[anchor, profile_only, other_project]
+                )
+            if tags & {
+                "memory:durable-decision", "project-anchor", "durable-decision"
+            }:
+                return SimpleNamespace(results=[])
+            return SimpleNamespace(
+                results=[ordinary, other_domain, noisy, anchor, profile_only]
+            )
+
+        p._client.arecall.side_effect = recalled_for_scope
+
+        results = p._recall_with_policy("What is the durable project decision?")
+
+        assert [result.id for result in results] == ["anchor", "ordinary"]
+        calls = p._client.arecall.call_args_list
+        assert len(calls) == 5
+        assert calls[0].kwargs["tags"] == [
+            self.PROJECT_TAG, "memory:project-anchor"
+        ]
+        assert calls[0].kwargs["tags_match"] == "all_strict"
+        assert calls[-1].kwargs["tags"] == [self.PROJECT_TAG]
+        assert calls[-1].kwargs["tags_match"] == "all_strict"
+        assert all("tag_groups" not in call.kwargs for call in calls)
+
+    def test_generic_route_remains_bounded_without_project_identity(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            route_policy={"general": {"max_results": 2}}
+        )
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            _memory_result("general one", []),
+            _memory_result("general two", []),
+            _memory_result("general three", []),
+        ])
+
+        results = p._recall_with_policy("remember my preference")
+
+        assert [result.text for result in results] == ["general one", "general two"]
+        assert p._client.arecall.call_count == 1
+
+    def test_route_selection_uses_trusted_host_metadata_not_query_text(
+        self, provider_with_config
+    ):
+        p = provider_with_config(route_policy={
+            "projects": {
+                self.PROJECT: {
+                    "match": {"paths": ["/trusted/worktrees/hermes"]}
+                }
+            }
+        })
+        inferred = p._resolve_route_context({
+            "cwd": "/unrelated",
+            "profile": "coding",
+            "session_id": "s",
+        })
+        matched = p._resolve_route_context({
+            "cwd": "/trusted/worktrees/hermes/task-1",
+            "profile": "coding",
+            "session_id": "s",
+        })
+
+        assert inferred.route_name == "general"
+        assert matched.project_tag == self.PROJECT_TAG
+        # A project name appearing only in user text has no selection path.
+        assert p._is_low_signal_query(
+            self.PROJECT, p._route_policy(inferred)
+        ) is False
+        assert p._resolve_route_context({"cwd": "/unrelated"}).route_name == "general"
+
+    def test_legacy_exact_route_migrates_without_keyword_inference(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            recall_routes={
+                "old-chat-route": {
+                    "required_tags": [self.PROJECT_TAG],
+                    "chat_ids": ["trusted-chat"],
+                    "keywords": ["do not infer this"],
+                    "max_results": 3,
+                }
+            }
+        )
+        matched = p._resolve_route_context({"chat_id": "trusted-chat"})
+        not_inferred = p._resolve_route_context({"chat_id": "other-chat"})
+
+        assert matched.project_tag == self.PROJECT_TAG
+        assert not_inferred.route_name == "general"
+        migrated = p._route_policy_config["projects"][self.PROJECT]
+        assert "keywords" not in migrated.get("match", {})
+
+    def test_low_signal_skips_but_meaningful_query_queues(
+        self, provider_with_config
+    ):
+        p = self._project_provider(provider_with_config)
+        p.on_turn_start(1, "ok")
+        p.queue_prefetch("ok", session_id="project-session")
+        assert p._prefetch_thread is None
+        assert p._last_route_diagnostic["skip_reason"] == "low_signal"
+
+        p._client.arecall.side_effect = lambda **kwargs: SimpleNamespace(results=[])
+        p.queue_prefetch(
+            "What project decision did we make?", session_id="project-session"
+        )
+        p._prefetch_thread.join(timeout=2)
+        assert p._client.arecall.call_count == 5
+        assert p._last_route_diagnostic["status"] == "ready"
+
+    def test_prefetch_two_turn_lifecycle_and_stale_route_rejection(
+        self, provider_with_config
+    ):
+        from agent.memory_manager import MemoryManager
+
+        p = self._project_provider(provider_with_config)
+        anchor = _memory_result(
+            "anchor visible on turn two",
+            [self.PROJECT_TAG, "memory:project-anchor"],
+        )
+        p._client.arecall.side_effect = lambda **kwargs: SimpleNamespace(
+            results=[anchor]
+        )
+        manager = MemoryManager()
+        manager.add_provider(p)
+
+        manager.on_turn_start(1, "first project question")
+        assert manager.prefetch_all(
+            "first project question", session_id="project-session"
+        ) == ""
+        manager.queue_prefetch_all(
+            "first project question", session_id="project-session"
+        )
+        assert manager.flush_pending(timeout=2)
+        p._prefetch_thread.join(timeout=2)
+
+        # Even after the worker is ready, a fresh same-turn read is impossible.
+        assert manager.prefetch_all(
+            "first project question", session_id="project-session"
+        ) == ""
+        manager.on_turn_start(2, "second question")
+        visible = manager.prefetch_all(
+            "second question", session_id="project-session"
+        )
+        assert "anchor visible on turn two" in visible
+        assert p._client.arecall.call_args_list[0].kwargs["query"] == "first project question"
+
+        # A ready envelope from the old project is rejected after trusted
+        # route identity changes, even if the session id stays the same.
+        from plugins.memory.hindsight import _PrefetchEnvelope
+        p._prefetch_result = _PrefetchEnvelope(
+            text="stale other-project memory",
+            query_fingerprint="abc",
+            session_id="project-session",
+            route_identity=("project:other", "project:other", "profile:coding"),
+            result_count=1,
+            latency_ms=1,
+            visible_after_turn=2,
+        )
+        assert manager.prefetch_all(
+            "second question", session_id="project-session"
+        ) == ""
+        assert p._last_route_diagnostic["status"] == "stale"
+
+    def test_prefetch_failure_is_fail_soft_and_truthful(
+        self, provider_with_config, caplog
+    ):
+        p = self._project_provider(provider_with_config)
+        p._client.arecall.side_effect = RuntimeError("backend unavailable")
+        p.on_turn_start(1, "meaningful project query")
+
+        caplog.clear()
+        with caplog.at_level("INFO"):
+            p.queue_prefetch(
+                "private meaningful project query", session_id="project-session"
+            )
+            p._prefetch_thread.join(timeout=2)
+
+        assert p._prefetch_result is None
+        assert p._last_route_diagnostic["status"] == "failed"
+        assert p._last_route_diagnostic["skip_reason"] == "RuntimeError"
+        logs = "\n".join(record.getMessage() for record in caplog.records)
+        assert "private meaningful project query" not in logs
+        assert "backend unavailable" not in logs
+        assert "route=project:hermes-agent-engineering" in logs
+
+    def test_project_retain_tags_and_operation_ids(
+        self, provider_with_config
+    ):
+        p = self._project_provider(provider_with_config)
+
+        p.sync_turn("first logical job", "first response")
+        p._retain_queue.join()
+        first = p._client.aretain_batch.call_args.kwargs
+        p.sync_turn("second logical job", "second response")
+        p._retain_queue.join()
+        second = p._client.aretain_batch.call_args.kwargs
+
+        tags = set(first["items"][0]["tags"])
+        assert tags >= {
+            self.PROJECT_TAG,
+            f"domain:{self.PROJECT}",
+            "profile:coding",
+            "memory:session-observation",
+            "source:automatic-session",
+        }
+        assert first["items"][0]["metadata"]["project_slug"] == self.PROJECT
+        assert first["items"][0]["metadata"]["memory_kind"] == "session_observation"
+        assert UUID(first["operation_id"]).version == 5
+        assert first["operation_id"] != second["operation_id"]
+
+    def test_operation_id_builder_is_deterministic_and_private(self):
+        identity = {
+            "bank_id": "private-bank",
+            "document_id": "private-document",
+            "job_scope": "private-job",
+            "content": "private conversation content",
+            "start_turn_index": 1,
+            "end_turn_index": 1,
+            "update_mode": "append",
+        }
+        operation_id = _build_automatic_retain_operation_id(**identity)
+        assert operation_id == _build_automatic_retain_operation_id(**identity)
+        assert operation_id != _build_automatic_retain_operation_id(
+            **{**identity, "end_turn_index": 2}
+        )
+        assert UUID(operation_id).version == 5
+        assert "private" not in operation_id
+
+    def test_async_retry_reuses_the_same_operation_id(
+        self, provider_with_config, monkeypatch
+    ):
+        p = self._project_provider(provider_with_config)
+        first_client = _make_mock_client()
+        first_client.aretain_batch.side_effect = RuntimeError(
+            "Cannot connect to host 127.0.0.1:8888"
+        )
+        second_client = _make_mock_client()
+        clients = iter([first_client, second_client])
+        p._mode = "local_embedded"
+        p._client = first_client
+        monkeypatch.setattr(p, "_get_client", lambda: next(clients))
+        monkeypatch.setattr(
+            p,
+            "_resolve_retain_target",
+            lambda fallback_document_id: (fallback_document_id, None),
+        )
+
+        p.sync_turn("retry this logical job", "one response")
+        p._retain_queue.join()
+
+        first_id = first_client.aretain_batch.call_args.kwargs["operation_id"]
+        second_id = second_client.aretain_batch.call_args.kwargs["operation_id"]
+        assert first_id == second_id
+        assert UUID(first_id).version == 5
+
+    def test_older_client_compatibility_omits_unsupported_operation_id(
+        self, provider_with_config
+    ):
+        p = self._project_provider(provider_with_config)
+        calls = []
+
+        class LegacyClient:
+            async def aretain_batch(
+                self, *, bank_id, items, document_id, retain_async
+            ):
+                calls.append({
+                    "bank_id": bank_id,
+                    "items": items,
+                    "document_id": document_id,
+                    "retain_async": retain_async,
+                })
+
+        p._client = LegacyClient()
+        p.sync_turn("legacy runtime", "still retains")
+        p._retain_queue.join()
+
+        assert len(calls) == 1
+        assert calls[0]["retain_async"] is True
+
+    def test_manual_retain_cannot_claim_anchor_or_other_project(
+        self, provider_with_config
+    ):
+        p = self._project_provider(provider_with_config)
+        result = json.loads(p.handle_tool_call("hindsight_retain", {
+            "content": "transient task progress",
+            "tags": ["memory:project-anchor", "project:other"],
+        }))
+        assert result["result"] == "Memory stored successfully."
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        assert "memory:project-anchor" not in item["tags"]
+        assert "project:other" not in item["tags"]
+        assert "memory:manual" in item["tags"]
+        assert self.PROJECT_TAG in item["tags"]
+
+
 # ---------------------------------------------------------------------------
 # sync_turn tests
 # ---------------------------------------------------------------------------
@@ -539,7 +910,11 @@ class TestSyncTurn:
         assert len(call_kwargs["items"]) == 1
         item = call_kwargs["items"][0]
         assert item["context"] == "conversation between Hermes Agent and the User"
-        assert item["tags"] == ["conv", "session1", "session:session-1"]
+        assert set(item["tags"]) >= {
+            "conv", "session1", "profile:fakeassistantname",
+            "memory:session-observation", "source:automatic-session",
+            "session:session-1",
+        }
         content = json.loads(item["content"])
         assert len(content) == 1
         assert content[0][0]["role"] == "user"
@@ -558,6 +933,9 @@ class TestSyncTurn:
         assert item["metadata"]["agent_identity"] == "fakeassistantname"
         assert item["metadata"]["turn_index"] == "1"
         assert item["metadata"]["message_count"] == "2"
+        assert item["metadata"]["memory_kind"] == "session_observation"
+        assert item["metadata"]["memory_source"] == "automatic_session"
+        assert UUID(call_kwargs["operation_id"]).version == 5
         assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?\+00:00", content[0][0]["timestamp"])
         assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", item["metadata"]["retained_at"])
 
@@ -693,7 +1071,7 @@ class TestSessionSwitchBufferFlush:
         provider.on_session_switch("new-sid")
 
         assert finished.is_set(), "switch returned before prefetch thread settled"
-        assert provider._prefetch_result == ""
+        assert provider._prefetch_result is None
 
     def test_flush_serializes_behind_pending_retains_via_writer_queue(
         self, provider_with_config
@@ -848,6 +1226,7 @@ class TestConfigSchema:
             "retain_tags", "retain_source",
             "retain_user_prefix", "retain_assistant_prefix",
             "recall_tags", "recall_tags_match",
+            "route_policy",
             "auto_recall", "auto_retain",
             "retain_every_n_turns", "retain_async", "retain_context",
             "recall_max_tokens", "recall_max_input_chars",
@@ -1146,13 +1525,13 @@ class TestClientAutoUpgradeRoutesThroughLazyDeps:
         return calls
 
     def test_upgrade_uses_install_specs_not_subprocess(self, tmp_path, monkeypatch):
-        from plugins.memory.hindsight import _MIN_CLIENT_VERSION
+        from plugins.memory.hindsight import _CLIENT_VERSION
         from tools.lazy_deps import InstallSpecsResult
 
         calls = self._init_with_outdated_client(
             tmp_path, monkeypatch, InstallSpecsResult(ok=True)
         )
-        assert calls == [(f"hindsight-client>={_MIN_CLIENT_VERSION}",)]
+        assert calls == [(f"hindsight-client=={_CLIENT_VERSION}",)]
 
     def test_blocked_upgrade_is_nonfatal_and_surfaces_reason(
         self, tmp_path, monkeypatch, caplog

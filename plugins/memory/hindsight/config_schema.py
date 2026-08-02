@@ -72,5 +72,16 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             ),
             inline=True,
         ),
+        ProviderField(
+            key="route_policy",
+            label="Route policy",
+            kind=KIND_TEXT,
+            default="",
+            description=(
+                "Optional JSON for trusted project routes and the bounded "
+                "general fallback. Project selection uses host metadata only."
+            ),
+            inline=True,
+        ),
     ),
 )
