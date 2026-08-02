@@ -11,6 +11,7 @@ from agent.project_identity import resolve_project_identity
 
 
 PROJECT = "hermes-agent-engineering"
+_MISSING = object()
 
 
 def _registry_documents(
@@ -30,6 +31,7 @@ def _registry_documents(
         },
     }
     card = {
+        "version": 2,
         "approved_clients": ["codex"],
         "clients": {},
         "codex_enabled": True,
@@ -275,6 +277,54 @@ def test_invalid_controller_registry_suppresses_profile_project_fallback(
         projects_db.create_project(
             conn,
             name="Must Not Override Invalid Authority",
+            slug="generic-project",
+            folders=[str(repository)],
+        )
+
+    assert resolve_project_identity(runtime_cwd=str(repository)) == {
+        "project_source": "controller_registry_invalid",
+        "project_match": "invalid",
+    }
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        pytest.param(_MISSING, id="missing"),
+        pytest.param(1, id="schema-v1"),
+        pytest.param(True, id="boolean-true"),
+        pytest.param("2", id="string-v2"),
+        pytest.param(3, id="unsupported-v3"),
+    ],
+)
+def test_invalid_project_card_version_suppresses_profile_project_fallback(
+    tmp_path, monkeypatch, version
+):
+    from hermes_cli import projects_db
+
+    root = tmp_path / "root"
+    repository = tmp_path / "repo"
+    workspace = tmp_path / "workspace"
+    repository.mkdir()
+    workspace.mkdir()
+
+    def mutate_card(card):
+        if version is _MISSING:
+            card.pop("version")
+        else:
+            card["version"] = version
+
+    _write_registry(
+        root,
+        repository,
+        workspace,
+        card_mutation=mutate_card,
+    )
+    profile_home = _set_profile_home(monkeypatch, root)
+    with projects_db.connect_closing(db_path=profile_home / "projects.db") as conn:
+        projects_db.create_project(
+            conn,
+            name="Must Not Override Invalid Card Version",
             slug="generic-project",
             folders=[str(repository)],
         )

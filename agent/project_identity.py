@@ -101,7 +101,9 @@ def _validated_project_roots(
         card.get("project_slug") or card.get("project_id") or card.get("id") or ""
     ).strip()
     if (
-        not isinstance(portfolio, dict)
+        type(card.get("version")) is not int
+        or card.get("version") != 2
+        or not isinstance(portfolio, dict)
         or portfolio.get("schema_version") != 2
         or portfolio.get("role") != "stable_parent"
         or card.get("portfolio_role") != "stable_parent"

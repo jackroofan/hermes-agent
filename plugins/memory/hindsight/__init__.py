@@ -75,6 +75,17 @@ _AUTOMATIC_RETAIN_OPERATION_NAMESPACE = uuid.uuid5(
 )
 _VALID_BUDGETS = {"low", "mid", "high"}
 _VALID_TAG_MATCHES = {"any", "all", "any_strict", "all_strict", "exact"}
+_PROJECT_IDENTITY_KEYS = (
+    "project_id",
+    "project_slug",
+    "project_name",
+    "project_source",
+    "project_match",
+)
+_FAIL_CLOSED_PROJECT_SOURCES = {
+    "controller_registry_invalid",
+    "controller_registry_refresh_failed",
+}
 _DEFAULT_PROJECT_MAX_RESULTS = 8
 _DEFAULT_GENERAL_MAX_RESULTS = 5
 _DEFAULT_PRIORITY_TAGS = (
@@ -1978,14 +1989,15 @@ class HindsightMemoryProvider(MemoryProvider):
         source = str(
             host.get("project_source") or host.get("source") or ""
         ).strip()
+        fail_closed = source in _FAIL_CLOSED_PROJECT_SOURCES
         configured = (
             None
-            if source == "controller_registry_invalid"
+            if fail_closed
             else self._matching_configured_project(host)
         )
-        project_id = str(host.get("project_id") or "").strip()
-        project_slug = str(host.get("project_slug") or "").strip()
-        project_name = str(host.get("project_name") or "").strip()
+        project_id = "" if fail_closed else str(host.get("project_id") or "").strip()
+        project_slug = "" if fail_closed else str(host.get("project_slug") or "").strip()
+        project_name = "" if fail_closed else str(host.get("project_name") or "").strip()
         if configured is not None and not (project_id or project_slug):
             key, route = configured
             canonical_tag, _, _ = _route_project_tags(key, route)
@@ -2016,6 +2028,8 @@ class HindsightMemoryProvider(MemoryProvider):
     def _live_route_input(self) -> dict[str, Any]:
         """Refresh cwd/Project identity from trusted runtime state."""
         host = copy.deepcopy(self._trusted_route_input)
+        for key in _PROJECT_IDENTITY_KEYS:
+            host.pop(key, None)
         host.setdefault("profile", self._agent_identity)
         host["session_id"] = self._session_id
         try:
@@ -2026,18 +2040,22 @@ class HindsightMemoryProvider(MemoryProvider):
             if cwd:
                 host["runtime_cwd"] = cwd
                 host.setdefault("cwd", cwd)
-            for key in (
-                "project_id", "project_slug", "project_name",
-                "project_source", "project_match",
-            ):
-                host.pop(key, None)
             host.update(resolve_project_identity(
                 session_cwd=str(host.get("cwd") or ""),
                 git_repo_root=str(host.get("git_repo_root") or ""),
                 runtime_cwd=str(host.get("runtime_cwd") or cwd or ""),
             ))
-        except Exception:
-            logger.debug("Hindsight trusted route refresh failed", exc_info=True)
+        except Exception as exc:
+            for key in _PROJECT_IDENTITY_KEYS:
+                host.pop(key, None)
+            host.update({
+                "project_source": "controller_registry_refresh_failed",
+                "project_match": "refresh_failed",
+            })
+            logger.debug(
+                "Hindsight trusted route refresh failed (%s)",
+                type(exc).__name__[:96],
+            )
         return host
 
     def _project_route_config(self, context: _RouteContext) -> dict[str, Any]:

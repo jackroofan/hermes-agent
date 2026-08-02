@@ -756,6 +756,81 @@ class TestProjectRouteGovernance:
             "runtime_cwd": str(runtime_cwd),
         }]
 
+    @pytest.mark.parametrize("failure_stage", ["import", "cwd", "resolver"])
+    def test_live_route_refresh_failure_discards_stale_project_authority(
+        self, provider_with_config, monkeypatch, tmp_path, caplog, failure_stage
+    ):
+        import builtins
+        import logging
+
+        p = provider_with_config(route_policy={
+            "projects": {
+                "configured-project": {
+                    "match": {"chat_ids": ["matched-chat"]},
+                }
+            }
+        })
+        runtime_cwd = tmp_path / "runtime-workspace"
+        runtime_cwd.mkdir()
+        p._trusted_route_input = {
+            "project_id": "stale-project",
+            "project_slug": "stale-project",
+            "project_name": "Stale Project",
+            "project_source": "controller_registry",
+            "project_match": "execution_workspace",
+            "chat_id": "matched-chat",
+            "cwd": str(runtime_cwd),
+        }
+        assert p._resolve_route_context({
+            "chat_id": "matched-chat"
+        }).project_tag == "project:configured-project"
+
+        cwd_resolver = MagicMock(return_value=runtime_cwd)
+        project_resolver = MagicMock(return_value={})
+        monkeypatch.setattr(
+            "agent.runtime_cwd.resolve_agent_cwd", cwd_resolver
+        )
+        monkeypatch.setattr(
+            "agent.project_identity.resolve_project_identity", project_resolver
+        )
+        failure = RuntimeError("sensitive-query-content")
+        if failure_stage == "cwd":
+            cwd_resolver.side_effect = failure
+        elif failure_stage == "resolver":
+            project_resolver.side_effect = failure
+
+        with caplog.at_level(logging.DEBUG, logger="plugins.memory.hindsight"):
+            if failure_stage == "import":
+                real_import = builtins.__import__
+
+                def fail_project_import(
+                    name, globals=None, locals=None, fromlist=(), level=0
+                ):
+                    if name == "agent.project_identity":
+                        raise ImportError("sensitive-query-content")
+                    return real_import(name, globals, locals, fromlist, level)
+
+                with monkeypatch.context() as import_patch:
+                    import_patch.setattr(builtins, "__import__", fail_project_import)
+                    refreshed = p._live_route_input()
+            else:
+                refreshed = p._live_route_input()
+
+        context = p._resolve_route_context(refreshed)
+
+        assert not {
+            "project_id", "project_slug", "project_name"
+        } & refreshed.keys()
+        assert refreshed["project_source"] == "controller_registry_refresh_failed"
+        assert refreshed["project_match"] == "refresh_failed"
+        assert context.route_name == "general"
+        assert context.project_id == ""
+        assert context.project_slug == ""
+        assert context.project_name == ""
+        assert context.project_tag == ""
+        assert context.source == "controller_registry_refresh_failed"
+        assert "sensitive-query-content" not in caplog.text
+
     def test_legacy_project_aliases_are_separate_or_scopes_and_preserve_tags(
         self, provider_with_config
     ):
