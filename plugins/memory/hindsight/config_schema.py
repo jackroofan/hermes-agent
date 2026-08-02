@@ -1,6 +1,9 @@
 """Hindsight's declared config surface — rendered by the generic desktop panel."""
 
 from plugins.memory.config_schema import (
+    KIND_BOOL,
+    KIND_JSON,
+    KIND_NUMBER,
     KIND_SECRET,
     KIND_SELECT,
     KIND_TEXT,
@@ -73,6 +76,14 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             inline=True,
         ),
         ProviderField(
+            key="recall_tags",
+            label="Recall tags",
+            kind=KIND_TEXT,
+            description="Comma-separated tags to filter when searching memories.",
+            placeholder="project:hermes, kind:note",
+            inline=True,
+        ),
+        ProviderField(
             key="route_policy",
             label="Route policy",
             kind=KIND_TEXT,
@@ -85,6 +96,67 @@ CONFIG_SCHEMA = ProviderConfigSchema(
                 "carry an alias. Project selection uses host metadata only."
             ),
             inline=True,
+        ),
+        ProviderField(
+            key="recall_routes",
+            label="Recall routes",
+            kind=KIND_JSON,
+            description=(
+                "Compatibility routes keyed or matched by exact chat identity, "
+                "with keyword fallback only for non-Project scope. Routes may "
+                "set tags, exclusions, prefixes, caps, score floors, priority "
+                "tags, retain tags, and automatic-recall controls."
+            ),
+            placeholder='{"chat-id": {"tags": ["profile:work"], "max_results": 2}}',
+            group="Recall routing",
+        ),
+        ProviderField(
+            key="recall_max_tokens",
+            label="Recall token cap",
+            kind=KIND_NUMBER,
+            default="4096",
+            description="Maximum tokens requested by recall and reflect operations.",
+            group="Recall routing",
+        ),
+        ProviderField(
+            key="recall_max_results",
+            label="Recall result cap",
+            kind=KIND_NUMBER,
+            default="0",
+            description="Global post-merge result cap; zero is unlimited and routes may override it.",
+            group="Recall routing",
+        ),
+        ProviderField(
+            key="recall_min_scores",
+            label="Recall score floors",
+            kind=KIND_JSON,
+            description="Optional semantic, keyword, reranker, and final score floors.",
+            placeholder='{"final": 0.6}',
+            group="Recall routing",
+        ),
+        ProviderField(
+            key="recall_skip_low_signal_queries",
+            label="Skip low-signal recall",
+            kind=KIND_BOOL,
+            default="false",
+            description="Suppress automatic recall for acknowledgement-like turns.",
+            group="Recall routing",
+        ),
+        ProviderField(
+            key="recall_low_signal_min_chars",
+            label="Low-signal length",
+            kind=KIND_NUMBER,
+            default="0",
+            description="Queries at least this long bypass low-signal suppression.",
+            group="Recall routing",
+        ),
+        ProviderField(
+            key="recall_domain_signal_keywords",
+            label="Recall signal keywords",
+            kind=KIND_TEXT,
+            description="Comma-separated domain keywords that always allow automatic recall.",
+            placeholder="memory, incident, 记忆",
+            group="Recall routing",
         ),
     ),
 )

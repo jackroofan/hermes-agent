@@ -61,6 +61,11 @@ FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
 MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
 
+# Once a local POSIX child exits, descendants that inherited its stdout pipe
+# no longer own the reader lifecycle. Preserve a bounded tail before finalizing.
+_LOCAL_EXIT_TAIL_DRAIN_SECONDS = 0.6
+_LOCAL_EXIT_TAIL_DRAIN_BYTES = 64 * 1024
+
 # Watch pattern rate limiting — PER SESSION.
 # Hard rule: at most ONE watch-match notification every WATCH_MIN_INTERVAL_SECONDS.
 # Any match arriving inside that cooldown window is dropped and counted as a strike.
@@ -954,11 +959,12 @@ class ProcessRegistry:
         ``notify_on_complete`` would never fire (``_reconcile_local_exit``
         only runs lazily from poll()/wait(), which an autonomous notification
         can't rely on). On POSIX we therefore ``select()`` with a short poll
-        interval and stop draining shortly after the direct child exits, even
-        if the pipe hasn't EOF'd — mirroring the foreground fix in
-        ``tools/environments/base.py::_wait_for_process`` (#8340). Windows
-        pipes don't support select(); the blocking path is kept there and the
-        lazy reconcile in poll()/wait() remains the safety net.
+        interval and, after the direct child exits, drain only a bounded tail
+        by time and bytes even if the pipe remains readable — mirroring the
+        foreground fix in ``tools/environments/base.py::_wait_for_process``
+        (#8340). Windows pipes don't support select(); the blocking path is
+        kept there and the lazy reconcile in poll()/wait() remains the safety
+        net.
         """
         first_chunk = True
         # Incremental decoder: raw pipe reads can split a multibyte UTF-8
@@ -1006,29 +1012,37 @@ class ProcessRegistry:
             if fd is not None:
                 import select as _select
 
-                idle_after_exit = 0
+                tail_deadline = None
+                tail_bytes = 0
                 while True:
+                    if tail_deadline is None and proc.poll() is not None:
+                        tail_deadline = (
+                            time.monotonic() + _LOCAL_EXIT_TAIL_DRAIN_SECONDS
+                        )
+
+                    select_timeout = 0.2
+                    read_size = 4096
+                    if tail_deadline is not None:
+                        remaining_time = tail_deadline - time.monotonic()
+                        remaining_bytes = _LOCAL_EXIT_TAIL_DRAIN_BYTES - tail_bytes
+                        if remaining_time <= 0 or remaining_bytes <= 0:
+                            break
+                        select_timeout = min(select_timeout, remaining_time)
+                        read_size = min(read_size, remaining_bytes)
+
                     try:
-                        ready, _, _ = _select.select([fd], [], [], 0.2)
+                        ready, _, _ = _select.select([fd], [], [], select_timeout)
                     except (ValueError, OSError):
                         break  # fd already closed
                     if ready:
-                        raw = raw_read(4096)
+                        raw = raw_read(read_size)
                         if not raw:
                             break  # true EOF — all writers closed
+                        if tail_deadline is not None:
+                            tail_bytes += len(raw)
                         chunk = decoder.decode(raw)
                         if chunk:
                             _append_chunk(chunk)
-                        idle_after_exit = 0
-                    elif proc.poll() is not None:
-                        # Direct child is gone and the pipe was idle for
-                        # ~200ms. Give it a few more cycles to catch any
-                        # buffered tail, then stop — otherwise we would wait
-                        # forever on a pipe held open by an orphaned
-                        # grandchild (issue #68915).
-                        idle_after_exit += 1
-                        if idle_after_exit >= 3:
-                            break
             else:
                 while True:
                     if raw_read is not None:
@@ -1056,6 +1070,14 @@ class ProcessRegistry:
                 tail = decoder.decode(b"", final=True)
                 if tail:
                     _append_chunk(tail)
+            except Exception:
+                pass
+            # We own the read end only for the direct child's lifecycle.
+            # Closing it releases a descendant that would otherwise block on
+            # a full inherited pipe after the bounded tail drain ends.
+            try:
+                if session.process.stdout is not None:
+                    session.process.stdout.close()
             except Exception:
                 pass
             # Always reap the child to prevent zombie processes.

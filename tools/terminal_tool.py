@@ -29,8 +29,10 @@ Usage:
     # Execute a simple command
     result = terminal_tool("ls -la")
 
-    # Execute in background
-    result = terminal_tool("python server.py", background=True)
+    # Execute an intentionally silent long-lived server in background
+    result = terminal_tool(
+        "python server.py", background=True, notify_on_complete=False
+    )
 """
 
 import importlib.util
@@ -1032,9 +1034,10 @@ Reserve terminal for: builds, installs, git, processes, scripts, network, packag
 Because exported environment state persists, activate a virtualenv or export setup variables once per session; do not re-source the same environment before every command unless a command proves the shell state was reset.
 
 Foreground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. Prefer foreground for short commands.
-Background: Set background=true to get a session_id. Almost always pair with notify_on_complete=true — bg without notify runs SILENTLY and you have no way to learn it finished short of calling process(action='poll') yourself. Two legitimate uses:
-  (1) Long-lived processes that never exit (servers, watchers, daemons) — silent is correct, there's no exit to notify on.
-  (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — MUST set notify_on_complete=true. Without it you'll either forget to poll or sit blocked waiting for the user to surface the result.
+Background: Set background=true to get a session_id and explicitly choose one observation mode; omission is rejected before spawn:
+  (1) Bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — set notify_on_complete=true so completion triggers a follow-on turn.
+  (2) Intentionally silent long-lived processes that never exit (servers, watchers, daemons) — explicitly set notify_on_complete=false.
+  (3) Rare readiness signals from long-lived processes — provide watch_patterns.
 For servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Hermes can track lifecycle and output.
 After starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.
 Use process(action="poll") for progress checks, process(action="wait") to block until done.
@@ -2117,22 +2120,24 @@ def _foreground_background_guidance(command: str) -> str | None:
     if _SHELL_LEVEL_BACKGROUND_RE.search(unquoted):
         return (
             "Foreground command uses shell-level background wrappers (nohup/disown/setsid). "
-            "Use terminal(background=true) so Hermes can track the process, then run "
-            "readiness checks and tests in separate commands."
+            "Use terminal(background=true, notify_on_complete=false) for an intentionally "
+            "long-lived process so Hermes can track it, then run readiness checks and tests "
+            "in separate commands."
         )
 
     if _INLINE_BACKGROUND_AMP_RE.search(unquoted) or _TRAILING_BACKGROUND_AMP_RE.search(unquoted):
         return (
-            "Foreground command uses '&' backgrounding. Use terminal(background=true) for long-lived "
-            "processes, then run health checks and tests in follow-up terminal calls."
+            "Foreground command uses '&' backgrounding. Use "
+            "terminal(background=true, notify_on_complete=false) for an intentionally "
+            "long-lived process, then run health checks and tests in follow-up terminal calls."
         )
 
     for pattern in _LONG_LIVED_FOREGROUND_PATTERNS:
         if pattern.search(unquoted):
             return (
                 "This foreground command appears to start a long-lived server/watch process. "
-                "Run it with background=true, verify readiness (health endpoint/log signal), "
-                "then execute tests in a separate command."
+                "Run it with background=true and notify_on_complete=false, verify readiness "
+                "(health endpoint/log signal), then execute tests in a separate command."
             )
 
     return None
@@ -2185,6 +2190,9 @@ def _resolve_command_cwd(
     return get_session_cwd(session_key) or default_cwd
 
 
+_NOTIFY_ON_COMPLETE_OMITTED = object()
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -2194,7 +2202,7 @@ def terminal_tool(
     force: bool = False,
     workdir: Optional[str] = None,
     pty: bool = False,
-    notify_on_complete: bool = False,
+    notify_on_complete: Any = _NOTIFY_ON_COMPLETE_OMITTED,
     watch_patterns: Optional[List[str]] = None,
 ) -> str:
     """
@@ -2209,7 +2217,7 @@ def terminal_tool(
         force: If True, skip dangerous command check (use after user confirms)
         workdir: Working directory for this command (optional, uses session cwd if not set)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
-        notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
+        notify_on_complete: Background observation intent. Set True for bounded work so completion is delivered, or explicitly set False for an intentionally silent long-lived server/daemon. When background=True and watch_patterns is absent or empty, omitting this argument is rejected before spawning. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
 
     Returns:
@@ -2219,8 +2227,19 @@ def terminal_tool(
         # Execute a simple command
         >>> result = terminal_tool(command="ls -la /tmp")
 
-        # Run a background task
-        >>> result = terminal_tool(command="python server.py", background=True)
+        # Run bounded work in the background and receive its completion
+        >>> result = terminal_tool(
+        ...     command="pytest tests/",
+        ...     background=True,
+        ...     notify_on_complete=True,
+        ... )
+
+        # Run an intentionally silent long-lived daemon
+        >>> result = terminal_tool(
+        ...     command="python server.py",
+        ...     background=True,
+        ...     notify_on_complete=False,
+        ... )
 
         # With custom timeout
         >>> result = terminal_tool(command="long_task.sh", timeout=300)
@@ -2240,6 +2259,25 @@ def terminal_tool(
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
             }, ensure_ascii=False)
+
+        notify_intent_omitted = notify_on_complete is _NOTIFY_ON_COMPLETE_OMITTED
+        if background and notify_intent_omitted and not watch_patterns:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": (
+                    "background=true requires explicit notification intent: "
+                    "set notify_on_complete=true for bounded work, "
+                    "notify_on_complete=false for an intentionally silent "
+                    "long-lived server/daemon, or provide watch_patterns for "
+                    "a rare long-lived readiness event."
+                ),
+                "status": "error",
+            }, ensure_ascii=False)
+        if notify_intent_omitted:
+            # Foreground calls and background watch-pattern mode retain the
+            # historical false value after omission has served its purpose.
+            notify_on_complete = False
 
         # Get configuration
         config = _get_env_config()
@@ -3136,7 +3174,10 @@ if __name__ == "__main__":
     print("  result = terminal_tool(command='ls -la')")
     print("  ")
     print("  # Run a background task")
-    print("  result = terminal_tool(command='python server.py', background=True)")
+    print(
+        "  result = terminal_tool(command='python server.py', "
+        "background=True, notify_on_complete=False)"
+    )
 
     print("\nEnvironment Variables:")
     default_img = "nikolaik/python-nodejs:python3.11-nodejs20"
@@ -3173,12 +3214,12 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run the command in the background. Almost always pair with notify_on_complete=true — without it, the process runs silently and you'll have no way to learn it finished short of calling process(action='poll') yourself (easy to forget, leading to silent blindness on long jobs). Two legitimate patterns: (1) Long-lived processes that never exit (servers, watchers, daemons) — these stay silent because there's no exit to notify on. (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — these MUST set notify_on_complete=true. For short commands, prefer foreground with a generous timeout instead.",
+                "description": "Run the command in the background. You must explicitly declare observation intent: notify_on_complete=true for bounded work; notify_on_complete=false only for an intentionally silent long-lived server/daemon; or watch_patterns for rare long-lived readiness signals. Omission is rejected before spawning. For short commands, prefer foreground with a generous timeout instead.",
                 "default": False
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily. Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true for longer commands.",
+                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily. Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true with explicit notification intent for longer commands.",
                 "minimum": 1
             },
             "workdir": {
@@ -3192,8 +3233,7 @@ TERMINAL_SCHEMA = {
             },
             "notify_on_complete": {
                 "type": "boolean",
-                "description": "When true (and background=true), you'll be automatically notified exactly once when the process finishes. **This is the right choice for almost every long-running task** — tests, builds, deployments, multi-item batch jobs, anything that takes over a minute and has a defined end. Use this and keep working on other things; the system notifies you on exit. MUTUALLY EXCLUSIVE with watch_patterns — when both are set, watch_patterns is dropped.",
-                "default": False
+                "description": "Required explicitly for background commands unless non-empty watch_patterns is provided. Set true for bounded work to receive exactly one completion; set false only for an intentionally silent long-lived server/daemon. MUTUALLY EXCLUSIVE with watch_patterns — when both are set, watch_patterns is dropped."
             },
             "watch_patterns": {
                 "type": "array",
@@ -3207,17 +3247,19 @@ TERMINAL_SCHEMA = {
 
 
 def _handle_terminal(args, **kw):
-    return terminal_tool(
-        command=args.get("command"),
-        background=args.get("background", False),
-        timeout=args.get("timeout"),
-        task_id=kw.get("task_id"),
-        session_id=kw.get("session_id"),
-        workdir=args.get("workdir"),
-        pty=args.get("pty", False),
-        notify_on_complete=args.get("notify_on_complete", False),
-        watch_patterns=args.get("watch_patterns"),
-    )
+    terminal_kwargs = {
+        "command": args.get("command"),
+        "background": args.get("background", False),
+        "timeout": args.get("timeout"),
+        "task_id": kw.get("task_id"),
+        "session_id": kw.get("session_id"),
+        "workdir": args.get("workdir"),
+        "pty": args.get("pty", False),
+        "watch_patterns": args.get("watch_patterns"),
+    }
+    if "notify_on_complete" in args:
+        terminal_kwargs["notify_on_complete"] = args["notify_on_complete"]
+    return terminal_tool(**terminal_kwargs)
 
 
 registry.register(

@@ -8317,12 +8317,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the head slot via ``merge_pending_message_event`` (album
         # semantics); everything else appends to the overflow tail.
         pending_slot = getattr(adapter, "_pending_messages", None)
-        existing = pending_slot.get(session_key) if isinstance(pending_slot, dict) else None
-        if existing is not None and (
-            getattr(existing, "message_type", None) == MessageType.PHOTO
-            or event.message_type == MessageType.PHOTO
-            or bool(getattr(existing, "media_urls", None))
-            or bool(getattr(event, "media_urls", None))
+        if not isinstance(pending_slot, dict):
+            return
+        existing = pending_slot.get(session_key)
+        incoming_internal = bool(getattr(event, "internal", False))
+
+        # Completion evidence is lower priority than real user work, but it is
+        # never disposable. Append internal events behind everything already
+        # accepted and exempt them from the user backlog cap.
+        if incoming_internal:
+            self._enqueue_fifo(session_key, event, adapter)
+            return
+
+        if (
+            existing is not None
+            and not getattr(existing, "internal", False)
+            and (
+                getattr(existing, "message_type", None) == MessageType.PHOTO
+                or event.message_type == MessageType.PHOTO
+                or bool(getattr(existing, "media_urls", None))
+                or bool(getattr(event, "media_urls", None))
+            )
         ):
             # Preserve photo-burst / media-merge semantics for the head slot.
             merge_pending_message_event(
@@ -8333,15 +8348,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return
 
-        if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
+        queue_state = self._session_state(session_key).conversation.queued_events
+        user_depth = int(
+            existing is not None and not getattr(existing, "internal", False)
+        ) + sum(not getattr(item, "internal", False) for item in queue_state)
+        if user_depth >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
-                "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
+                "Dropping busy-mode user follow-up for session %s — pending queue at cap (%d).",
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
             )
             return
 
-        self._enqueue_fifo(session_key, event, adapter)
+        # Real user input takes the next available slot ahead of internal
+        # completions while preserving FIFO order within both priority classes.
+        if existing is None:
+            pending_slot[session_key] = event
+            return
+        if getattr(existing, "internal", False):
+            pending_slot[session_key] = event
+            queue_state.insert(0, existing)
+            return
+        for index, queued in enumerate(queue_state):
+            if getattr(queued, "internal", False):
+                queue_state.insert(index, event)
+                return
+        queue_state.append(event)
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -8381,6 +8413,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return (enriched_text or text).strip()
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        # Internal completions are opaque agent evidence, not user input. Queue
+        # them directly so they cannot enter authorization, approval, steer,
+        # interrupt, acknowledgement, or adapter text-merge paths.
+        if getattr(event, "internal", False):
+            adapter = self._adapter_for_source(event.source)
+            if adapter is None:
+                return False
+            # A queue-mode user message may still be inside the adapter's
+            # debounce buffer. Materialize it first so a later completion
+            # cannot jump ahead or merge into that user turn.
+            flush_debounce = getattr(adapter, "_flush_text_debounce_now", None)
+            if inspect.iscoroutinefunction(flush_debounce):
+                await flush_debounce(session_key)
+            self._queue_or_replace_pending_event(session_key, event)
+            return True
+
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
@@ -8505,20 +8553,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not adapter:
             return False  # let default path handle it
 
-        # --- Internal synthetic events must never interrupt/steer ---
-        # Async-delegation completions (delegate_task(background=true)) and
-        # background-process completions (terminal notify_on_complete) re-enter
-        # the originating session as internal MessageEvents. When the session
-        # is busy, treating them like a user TEXT message means interrupt-mode
-        # (the default busy_text_mode) aborts the active turn AND sends a "⚡
-        # Interrupting current task" ack — exactly the opposite of the design
-        # invariant that a completion surfaces as a NEW turn only when idle and
-        # never splices into a running turn. Fall through to the base adapter,
-        # which queues internal events silently (no interrupt, no ack) so they
-        # cascade after the current turn finishes.
-        if getattr(event, "internal", False):
-            return False
-
         _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None
 
@@ -8529,6 +8563,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and busy_text_mode == "queue"
             and effective_mode != "steer"
         ):
+            pending = getattr(adapter, "_pending_messages", {}).get(session_key)
+            if getattr(pending, "internal", False):
+                self._queue_or_replace_pending_event(session_key, event)
+                return True
             return False
 
         # Steer mode: inject mid-run via running_agent.steer() instead of
@@ -13780,7 +13818,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
         _up_state = self._peek_session_state(_quick_key)
-        if _up_state is not None and _up_state.persistent.update_prompt_pending:
+        if (
+            not is_internal
+            and _up_state is not None
+            and _up_state.persistent.update_prompt_pending
+        ):
             raw = (event.text or "").strip()
             # Accept /approve and /deny as shorthand for yes/no
             cmd = event.get_command()
@@ -13852,13 +13894,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # to the second option, arbitrary text becomes a custom answer). Slash
         # commands still bypass this path so /stop and friends keep working.
         _clarify_mod = None
-        try:
-            from tools import clarify_gateway as _clarify_mod
-            _pending_clarify = _clarify_mod.get_pending_for_session(
-                _quick_key, include_choice_prompts=True,
-            )
-        except Exception:
-            _pending_clarify = None
+        _pending_clarify = None
+        if not is_internal:
+            try:
+                from tools import clarify_gateway as _clarify_mod
+                _pending_clarify = _clarify_mod.get_pending_for_session(
+                    _quick_key, include_choice_prompts=True,
+                )
+            except Exception:
+                _pending_clarify = None
         if _pending_clarify is not None and _clarify_mod is not None:
             _clarify_has_audio = bool(self._pending_event_audio_paths(event))
             _raw_clarify_reply = await self._prepare_clarify_reply_text(event)
@@ -13914,13 +13958,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # precedence — /approve there unblocks the waiting tool thread.
         # Slash-confirm only catches /approve when no tool approval is live.
         from tools import slash_confirm as _slash_confirm_mod
-        _pending_confirm = _slash_confirm_mod.get_pending(_quick_key)
+        _pending_confirm = None
         _tool_approval_live = False
-        try:
-            from tools.approval import has_blocking_approval
-            _tool_approval_live = has_blocking_approval(_quick_key)
-        except Exception:
-            _tool_approval_live = False
+        if not is_internal:
+            _pending_confirm = _slash_confirm_mod.get_pending(_quick_key)
+            try:
+                from tools.approval import has_blocking_approval
+                _tool_approval_live = has_blocking_approval(_quick_key)
+            except Exception:
+                _tool_approval_live = False
         if _pending_confirm and not _tool_approval_live:
             _raw_reply = (event.text or "").strip()
             # Accept bang-prefixed replies (`!always`, `!cancel`) verbatim.
@@ -14015,6 +14061,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._release_running_agent_state(_quick_key)
 
         if self._is_session_running(_quick_key):
+            if is_internal:
+                self._queue_or_replace_pending_event(_quick_key, event)
+                return None
+
             # Resolve the command once; every command's mid-run behavior is
             # declared on its CommandDef (busy_policy / busy_handler in
             # hermes_cli/commands.py) and dispatched through the single
@@ -14217,7 +14267,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
 
         # Check for commands
-        command = event.get_command()
+        command = None if is_internal else event.get_command()
 
         from hermes_cli.commands import (
             GATEWAY_KNOWN_COMMANDS,
@@ -24349,7 +24399,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # as user input.  The primary fix is in base.py (commands bypass the
             # active-session guard), but this catches edge cases where command
             # text leaks through the interrupt_message fallback.
-            if pending and pending.strip().startswith("/"):
+            if (
+                pending
+                and not getattr(pending_event, "internal", False)
+                and pending.strip().startswith("/")
+            ):
                 _pending_parts = pending.strip().split(None, 1)
                 _pending_cmd_word = _pending_parts[0][1:].lower() if _pending_parts else ""
                 if _pending_cmd_word:

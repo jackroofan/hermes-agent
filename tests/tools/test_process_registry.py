@@ -2,6 +2,7 @@
 
 import json
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -1470,3 +1471,52 @@ class TestReaderLoopOrphanedPipe:
             except (ProcessLookupError, PermissionError):
                 pass
 
+    def test_chatty_orphan_completes_once_without_poll_or_wait(self, registry):
+        """A descendant that keeps stdout readable must not own completion."""
+        producer = (
+            "import os\n"
+            "if os.fork():\n"
+            "    os.write(1, b'direct-child-exited\\n')\n"
+            "    os._exit(0)\n"
+            "chunk = b'chatty-descendant-tail\\n' * 256\n"
+            "while True:\n"
+            "    os.write(1, chunk)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", producer],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            preexec_fn=os.setsid,
+        )
+        s = _make_session(sid="proc_chatty_orphan")
+        s.process = proc
+        s.pid = proc.pid
+        s.notify_on_complete = True
+        registry._running[s.id] = s
+
+        done = threading.Event()
+
+        def _run():
+            registry._reader_loop(s)
+            done.set()
+
+        reader = threading.Thread(target=_run, daemon=True)
+        reader.start()
+        try:
+            assert done.wait(timeout=5.0), (
+                "a continuously writing descendant kept the reader/session alive"
+            )
+            item = registry.completion_queue.get_nowait()
+            assert item["type"] == "completion"
+            assert item["session_id"] == s.id
+            assert item["exit_code"] == 0
+            assert "chatty-descendant-tail" in item["output"]
+            with pytest.raises(queue.Empty):
+                registry.completion_queue.get_nowait()
+        finally:
+            if proc.stdout is not None:
+                proc.stdout.close()
+            reader.join(timeout=2.0)

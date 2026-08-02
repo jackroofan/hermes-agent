@@ -158,6 +158,50 @@ async def test_consumed_completion_skips_raw_notification_without_agent_notify(
 
 
 @pytest.mark.asyncio
+async def test_failed_completion_triggers_one_bounded_agent_follow_on(
+    monkeypatch, tmp_path
+):
+    """Failures wake the agent once with exit status and a bounded text tail."""
+    import tools.process_registry as pr_module
+
+    sessions = [SimpleNamespace(
+        output_buffer=("discarded-prefix\n" + "x" * 5000 + "\nfinal failure\n"),
+        exited=True,
+        exit_code=7,
+        command="python failing_job.py",
+        started_at=1234.5,
+        completion_reason="exited",
+        termination_source="",
+    )]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    watcher = _watcher_dict("proc_failed")
+    watcher.update(
+        {
+            "session_key": "agent:main:telegram:dm:123",
+            "chat_type": "dm",
+            "notify_on_complete": True,
+        }
+    )
+
+    await runner._run_process_watcher(watcher)
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.internal is True
+    assert "exit code 7" in event.text
+    assert "final failure" in event.text
+    assert "discarded-prefix" not in event.text
+    assert event.text.count("x") <= 2000
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_routes_from_session_store_origin(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 

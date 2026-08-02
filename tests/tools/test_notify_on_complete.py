@@ -173,18 +173,35 @@ class TestTerminalSchema:
         props = TERMINAL_SCHEMA["parameters"]["properties"]
         assert "notify_on_complete" in props
         assert props["notify_on_complete"]["type"] == "boolean"
-        assert props["notify_on_complete"]["default"] is False
+        assert "default" not in props["notify_on_complete"]
+        assert "notify_on_complete" not in TERMINAL_SCHEMA["parameters"]["required"]
 
-    def test_handler_passes_notify(self):
-        """_handle_terminal passes notify_on_complete to terminal_tool."""
+    @pytest.mark.parametrize("notification_intent", [True, False])
+    def test_handler_passes_explicit_notify(self, notification_intent):
+        """_handle_terminal preserves either explicit boolean value."""
         from tools.terminal_tool import _handle_terminal
         with patch("tools.terminal_tool.terminal_tool", return_value='{"ok":true}') as mock_tt:
             _handle_terminal(
-                {"command": "echo hi", "background": True, "notify_on_complete": True},
+                {
+                    "command": "echo hi",
+                    "background": True,
+                    "notify_on_complete": notification_intent,
+                },
                 task_id="t1",
             )
             _, kwargs = mock_tt.call_args
-            assert kwargs["notify_on_complete"] is True
+            assert kwargs["notify_on_complete"] is notification_intent
+
+    def test_handler_preserves_omitted_notify(self):
+        """The handler must not manufacture false when the field is absent."""
+        from tools.terminal_tool import _handle_terminal
+        with patch("tools.terminal_tool.terminal_tool", return_value='{"ok":true}') as mock_tt:
+            _handle_terminal(
+                {"command": "echo hi", "background": True},
+                task_id="t1",
+            )
+            _, kwargs = mock_tt.call_args
+            assert "notify_on_complete" not in kwargs
 
 
 # =========================================================================
@@ -267,14 +284,11 @@ class TestCompletionConsumed:
 
 
 # ---------------------------------------------------------------------------
-# Silent-background-process hint
+# Background notification intent
 #
-# background=True without notify_on_complete=True OR watch_patterns runs
-# the process silently — the agent has no way to learn it finished short
-# of calling process(action="poll") explicitly. The tool result must
-# include a "hint" field that nudges the agent toward
-# notify_on_complete=True for bounded tasks. May 2026 PR #31231 incident:
-# bg CI poller exited green, agent never noticed, user had to surface it.
+# background=True must declare how it will be observed: completion
+# notification for bounded work, explicit silence for a daemon, or rare
+# readiness watch patterns. Omission must fail before process creation.
 # ---------------------------------------------------------------------------
 
 
@@ -300,8 +314,8 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     config = _silent_bg_base_config(tmp_path)
     dummy_env = SimpleNamespace(env={})
 
-    def fake_spawn_local(**kwargs):
-        return SimpleNamespace(
+    fake_spawn_local = MagicMock(
+        return_value=SimpleNamespace(
             id="proc_silent_test",
             pid=4242,
             notify_on_complete=False,
@@ -313,6 +327,7 @@ def _silent_bg_harness(monkeypatch, tmp_path):
             watcher_message_id="",
             watcher_interval=0,
         )
+    )
 
     monkeypatch.setattr(terminal_tool_module, "_get_env_config", lambda: config)
     monkeypatch.setattr(terminal_tool_module, "_start_cleanup_thread", lambda: None)
@@ -323,10 +338,14 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     return terminal_tool_module
 
 
-def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_path):
-    """The footgun case (May 2026 PR #31231): bg=True alone runs silently
-    and the agent has no signal it finished. Tool must nudge."""
+def test_background_omitted_notification_intent_rejects_before_spawn(
+    monkeypatch, tmp_path
+):
+    """Omitted intent must never create an unobservable background process."""
     tt = _silent_bg_harness(monkeypatch, tmp_path)
+    from tools import process_registry as process_registry_module
+
+    spawn_local = process_registry_module.process_registry.spawn_local
     try:
         result = json.loads(
             tt.terminal_tool(
@@ -338,20 +357,44 @@ def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_pa
         tt._active_environments.pop("default", None)
         tt._last_activity.pop("default", None)
 
-    assert result["session_id"] == "proc_silent_test"
-    hint = result.get("hint", "")
-    assert hint, "Silent background process must include a hint field"
-    assert "notify_on_complete" in hint, (
-        "Hint must name the corrective flag so the agent can self-correct"
-    )
-    assert "silent" in hint.lower() or "no way to learn" in hint.lower(), (
-        "Hint must explain the failure mode, not just suggest the fix"
-    )
+    spawn_local.assert_not_called()
+    assert result["status"] == "error"
+    assert "notify_on_complete=true" in result["error"]
+    assert "notify_on_complete=false" in result["error"]
+    assert "watch_patterns" in result["error"]
+
+
+def test_background_empty_watch_patterns_still_requires_explicit_intent(
+    monkeypatch, tmp_path
+):
+    """An empty watch list is not an observation mode."""
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    from tools import process_registry as process_registry_module
+
+    spawn_local = process_registry_module.process_registry.spawn_local
+    try:
+        result = json.loads(
+            tt.terminal_tool(
+                command="python server.py",
+                background=True,
+                watch_patterns=[],
+            )
+        )
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    spawn_local.assert_not_called()
+    assert result["status"] == "error"
+    assert "explicit notification intent" in result["error"]
 
 
 def test_background_with_notify_does_not_emit_hint(monkeypatch, tmp_path):
-    """The correct shape — bg+notify together — must not nag."""
+    """Bounded background work with completion notification still spawns."""
     tt = _silent_bg_harness(monkeypatch, tmp_path)
+    from tools import process_registry as process_registry_module
+
+    spawn_local = process_registry_module.process_registry.spawn_local
     try:
         result = json.loads(
             tt.terminal_tool(
@@ -368,6 +411,55 @@ def test_background_with_notify_does_not_emit_hint(monkeypatch, tmp_path):
         f"Correct usage must not emit a hint, got: {result.get('hint')!r}"
     )
     assert result.get("notify_on_complete") is True
+    spawn_local.assert_called_once()
+
+
+def test_background_with_explicit_false_spawns_silent_daemon(monkeypatch, tmp_path):
+    """Explicit false remains the accepted mode for a silent daemon."""
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    from tools import process_registry as process_registry_module
+
+    spawn_local = process_registry_module.process_registry.spawn_local
+    try:
+        result = json.loads(
+            tt.terminal_tool(
+                command="python server.py",
+                background=True,
+                notify_on_complete=False,
+            )
+        )
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert result["session_id"] == "proc_silent_test"
+    assert result["error"] is None
+    assert "notify_on_complete" in result["hint"]
+    spawn_local.assert_called_once()
+
+
+def test_background_with_watch_patterns_spawns_without_notify(monkeypatch, tmp_path):
+    """Non-empty watch_patterns is an accepted observation mode."""
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    from tools import process_registry as process_registry_module
+
+    spawn_local = process_registry_module.process_registry.spawn_local
+    try:
+        result = json.loads(
+            tt.terminal_tool(
+                command="python server.py",
+                background=True,
+                watch_patterns=["ready"],
+            )
+        )
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert result["session_id"] == "proc_silent_test"
+    assert result["watch_patterns"] == ["ready"]
+    assert "hint" not in result
+    spawn_local.assert_called_once()
 
 
 def test_foreground_command_does_not_emit_hint(monkeypatch, tmp_path):

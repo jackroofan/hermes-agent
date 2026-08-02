@@ -48,6 +48,7 @@ def test_terminal_background_keeps_pty_for_regular_interactive_commands(monkeypa
                 command="python3 -c \"print(input())\"",
                 background=True,
                 pty=True,
+                notify_on_complete=True,
             )
         )
     finally:

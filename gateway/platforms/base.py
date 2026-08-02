@@ -2110,8 +2110,8 @@ class MessageEvent:
     # trigger message alone, then prepend this context afterward.
     channel_context: Optional[str] = None
     
-    # Internal flag — set for synthetic events (e.g. background process
-    # completion notifications) that must bypass user authorization checks.
+    # Internal flag — trusted synthetic agent evidence (including completion
+    # notifications). Its text is opaque to gateway user-input/control handlers.
     internal: bool = False
 
     # Free-form per-event metadata.  Adapters may set platform-specific
@@ -5543,7 +5543,9 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
-        coerce_plaintext_gateway_command(event)
+        is_internal = bool(getattr(event, "internal", False))
+        if not is_internal:
+            coerce_plaintext_gateway_command(event)
 
         # Rewrite ``event.source.thread_id`` via the installed recovery hook
         # (Telegram DM topic mode) so the session key, guard checks, and
@@ -5577,7 +5579,7 @@ class BasePlatformAdapter(ABC):
             # response.  Do NOT use _process_message_background — it manages
             # session lifecycle and its cleanup races with the running task
             # (see PR #4926).
-            cmd = event.get_command()
+            cmd = None if is_internal else event.get_command()
             from hermes_cli.commands import (
                 is_interrupt_then_dispatch,
                 should_bypass_active_session,
@@ -5641,7 +5643,7 @@ class BasePlatformAdapter(ABC):
             # Same shape as the /approve deadlock fix (PR #4926) — both
             # cases are "agent thread blocked on Event.wait, message must
             # reach the resolver before being treated as a new turn."
-            if not cmd:
+            if not is_internal and not cmd:
                 try:
                     from tools import clarify_gateway as _clarify_mod
                     _has_text_clarify = (
@@ -5761,6 +5763,7 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        is_internal = bool(getattr(event, "internal", False))
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
@@ -5880,11 +5883,12 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
 
                 local_files = []
-                if not is_ephemeral_response:
+                if not is_ephemeral_response and not is_internal:
                     # Auto-detect bare local file paths for native media delivery
                     # (helps small models that don't use MEDIA: syntax). Skip
-                    # system/command notices so config paths stay visible text
-                    # instead of becoming native uploads.
+                    # internal completion evidence and system/command notices so
+                    # artifact-like paths stay visible text instead of becoming
+                    # native uploads. Explicit MEDIA: directives are handled above.
                     local_files, text_content = self.extract_local_files(text_content)
                     local_files = self.filter_local_delivery_paths(local_files)
                     if _history_media_paths:
@@ -6545,8 +6549,12 @@ class BasePlatformAdapter(ABC):
         self._text_debounce_store().clear()
 
     def has_pending_interrupt(self, session_key: str) -> bool:
-        """Check if there's a pending interrupt for a session."""
-        return session_key in self._active_sessions and self._active_sessions[session_key].is_set()
+        """Whether a signalled user/control event should interrupt this session."""
+        active = self._active_sessions.get(session_key)
+        if active is None or not active.is_set():
+            return False
+        pending = self._pending_messages.get(session_key)
+        return not bool(getattr(pending, "internal", False))
     
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""

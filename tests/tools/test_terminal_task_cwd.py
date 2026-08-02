@@ -90,7 +90,12 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
 
         def spawn_local(self, **kwargs):
             self.calls.append(kwargs)
-            return SimpleNamespace(id="proc_test", pid=1234)
+            return SimpleNamespace(
+                id="proc_test",
+                pid=1234,
+                notify_on_complete=False,
+                watcher_platform="",
+            )
 
     import tools.process_registry as process_registry_mod
 
@@ -116,6 +121,7 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
             command="sleep 1",
             task_id=task_id,
             background=True,
+            notify_on_complete=True,
         )
     )
 

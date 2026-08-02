@@ -291,6 +291,41 @@ class TestConfig:
         assert p._observation_scopes == "per_tag"
 
 
+    @pytest.mark.parametrize(
+        ("configured_tags", "expected_tags"),
+        [
+            ("project:hermes, kind:note, project:hermes", ["project:hermes", "kind:note"]),
+            ('["project:hermes", "kind:note", "project:hermes"]', ["project:hermes", "kind:note"]),
+            ([" project:hermes ", "kind:note", "project:hermes"], ["project:hermes", "kind:note"]),
+            (" , ", None),
+            ([], None),
+        ],
+        ids=["csv", "json-list-string", "python-list", "empty-string", "empty-list"],
+    )
+    def test_recall_tags_config_is_normalized(
+        self, provider_with_config, configured_tags, expected_tags
+    ):
+        provider = provider_with_config(recall_tags=configured_tags)
+
+        assert provider._recall_tags == expected_tags
+
+    def test_recall_tags_normalization_does_not_mutate_loaded_config(self, monkeypatch):
+        configured_tags = [" project:hermes ", "kind:note", "project:hermes"]
+        config = {
+            "mode": "cloud",
+            "apiKey": "test-key",
+            "recall_tags": configured_tags,
+        }
+        monkeypatch.setattr("plugins.memory.hindsight._load_config", lambda: config)
+
+        provider = HindsightMemoryProvider()
+        provider.initialize(session_id="test-session", platform="cli")
+
+        assert config["recall_tags"] is configured_tags
+        assert configured_tags == [" project:hermes ", "kind:note", "project:hermes"]
+        assert provider._recall_tags == ["project:hermes", "kind:note"]
+        assert provider._recall_tags is not configured_tags
+
     def test_custom_config_values(self, provider_with_config):
         p = provider_with_config(
             retain_tags=["tag1", "tag2"],
@@ -348,6 +383,7 @@ class TestConfig:
 
         monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
         monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+        monkeypatch.setattr("tools.lazy_deps.ensure", lambda *args, **kwargs: None)
 
         p = HindsightMemoryProvider()
         p._mode = "local_embedded"
@@ -501,6 +537,334 @@ class TestToolHandlers:
 # ---------------------------------------------------------------------------
 
 
+class TestRouteAwareIsolation:
+    def test_routes_load_from_json_and_exact_identity_beats_keyword(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            recall_routes=json.dumps({
+                "keyword": {
+                    "keywords": ["automation"],
+                    "tags": ["scope:keyword"],
+                },
+                "Memory Team": {"tags": ["scope:name"]},
+                "by-id": {
+                    "chat_ids": ["telegram-chat"],
+                    "tags": ["scope:id"],
+                },
+            })
+        )
+
+        p._chat_id = "telegram-chat"
+        p._chat_name = "Memory Team"
+        assert p._select_recall_route("automation update") is p._recall_routes["by-id"]
+
+        p._chat_id = "unknown"
+        assert p._select_recall_route("automation update") is p._recall_routes["Memory Team"]
+
+        p._chat_name = "unknown"
+        assert p._select_recall_route("automation update") is p._recall_routes["keyword"]
+        assert p._recall_domain_routing is True
+
+    def test_routed_recall_applies_policy_and_fails_closed(self, provider_with_config):
+        p = provider_with_config(
+            recall_max_tokens=777,
+            recall_max_results=1,
+            recall_routes={
+                "memory": {
+                    "chat_ids": ["route-chat"],
+                    "tags": ["scope:memory"],
+                    "tags_match": "all_strict",
+                    "exclude_tags": ["scope:blocked"],
+                    "query_prefix": "memory-route",
+                    "max_results": 2,
+                    "min_scores": {"final": 0.6},
+                    "priority_tags": ["tier:priority"],
+                    "priority_tags_match": "any_strict",
+                }
+            },
+        )
+        p._chat_id = "route-chat"
+        p._client.arecall = AsyncMock(side_effect=[
+            SimpleNamespace(results=[
+                SimpleNamespace(
+                    id="priority",
+                    text="priority",
+                    tags=["scope:memory", "tier:priority"],
+                ),
+                SimpleNamespace(
+                    id="wrong-priority",
+                    text="wrong priority",
+                    tags=["scope:other", "tier:priority"],
+                ),
+            ]),
+            SimpleNamespace(results=[
+                SimpleNamespace(
+                    id="blocked",
+                    text="blocked",
+                    tags=["scope:memory", "scope:blocked"],
+                ),
+                SimpleNamespace(id="normal", text="normal", tags=["scope:memory"]),
+                SimpleNamespace(id="off-domain", text="off domain", tags=["scope:other"]),
+                SimpleNamespace(id="untagged", text="untagged"),
+                SimpleNamespace(id="overflow", text="overflow", tags=["scope:memory"]),
+            ]),
+        ])
+
+        result = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "route question"}
+        ))["result"]
+
+        assert result == "1. priority\n2. normal"
+        assert len(p._client.arecall.call_args_list) == 2
+        assert all(
+            call.kwargs["max_tokens"] == 777
+            and call.kwargs["min_scores"] == {"final": 0.6}
+            for call in p._client.arecall.call_args_list
+        )
+        normal_kwargs = p._client.arecall.call_args_list[1].kwargs
+        assert normal_kwargs["query"] == "memory-route\n\nroute question"
+        assert normal_kwargs["tag_groups"] == [{
+            "and": [
+                {"tags": ["scope:memory"], "match": "all_strict"},
+                {"not": {"tags": ["scope:blocked"], "match": "any_strict"}},
+            ]
+        }]
+        route = p._recall_routes["memory"]
+        assert p._effective_recall_max_results(route) == 2
+        assert p._effective_recall_min_scores(route) == {"final": 0.6}
+
+    def test_legacy_tag_filter_client_uses_constrained_fail_closed_fallback(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            recall_routes={
+                "memory": {
+                    "keywords": ["memory"],
+                    "tags": ["scope:memory"],
+                    "exclude_tags": ["scope:blocked"],
+                }
+            }
+        )
+        calls = []
+
+        async def legacy_arecall(
+            bank_id,
+            query,
+            budget="mid",
+            max_tokens=4096,
+            types=None,
+            tags=None,
+            tags_match="any",
+        ):
+            calls.append({"tags": tags, "tags_match": tags_match})
+            return SimpleNamespace(results=[
+                {"id": "safe", "text": "safe", "tags": ["scope:memory"]},
+                {"id": "off", "text": "off", "tags": ["scope:other"]},
+                {
+                    "id": "blocked",
+                    "text": "blocked",
+                    "tags": ["scope:memory", "scope:blocked"],
+                },
+            ])
+
+        p._client.arecall = legacy_arecall
+
+        result = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "memory query"}
+        ))["result"]
+
+        assert result == "1. safe"
+        assert calls == [{"tags": ["scope:memory"], "tags_match": "any"}]
+
+    def test_score_floors_remain_safe_with_current_fixed_signature_client(
+        self, provider_with_config
+    ):
+        p = provider_with_config(recall_min_scores={"final": 0.6})
+        calls = []
+
+        async def legacy_arecall(
+            bank_id,
+            query,
+            budget="mid",
+            max_tokens=4096,
+            types=None,
+            tags=None,
+            tags_match="any",
+        ):
+            calls.append(query)
+            return SimpleNamespace(results=[
+                {"id": "low", "text": "low", "scores": {"final": 0.5}},
+                {"id": "high", "text": "high", "scores": {"final": 0.7}},
+                {"id": "unknown", "text": "unknown"},
+            ])
+
+        p._client.arecall = legacy_arecall
+
+        result = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "scored query"}
+        ))["result"]
+
+        assert result == "1. high"
+        assert calls == ["scored query"]
+
+    def test_exclude_only_route_fails_closed_when_client_cannot_express_it(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            recall_routes={
+                "memory": {
+                    "keywords": ["memory"],
+                    "exclude_tags": ["scope:blocked"],
+                }
+            }
+        )
+        calls = []
+
+        async def legacy_arecall(
+            bank_id,
+            query,
+            budget="mid",
+            max_tokens=4096,
+            types=None,
+        ):
+            calls.append(query)
+            return SimpleNamespace(results=[])
+
+        p._client.arecall = legacy_arecall
+
+        result = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "memory query"}
+        ))["result"]
+
+        assert result == "No relevant memories found."
+        assert calls == []
+
+    def test_low_signal_gate_only_suppresses_automatic_acknowledgements(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            recall_skip_low_signal_queries=True,
+            recall_low_signal_min_chars=12,
+            recall_domain_signal_keywords=["incident"],
+        )
+
+        p.queue_prefetch("好的")
+        assert p._prefetch_thread is None
+        p._client.arecall.assert_not_called()
+
+        p.queue_prefetch("memory")
+        assert p._prefetch_thread is not None
+        p._prefetch_thread.join(timeout=5.0)
+        p._client.arecall.assert_called_once()
+
+        p._client.arecall.reset_mock()
+        explicit = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "ok"}
+        ))["result"]
+        assert "Memory 1" in explicit
+        p._client.arecall.assert_called_once()
+
+    def test_route_can_disable_auto_recall_without_disabling_explicit_recall(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            recall_routes={
+                "route-chat": {
+                    "tags": ["scope:memory"],
+                    "auto_recall": False,
+                }
+            }
+        )
+        p._chat_id = "route-chat"
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(text="explicit memory", tags=["scope:memory"])
+        ])
+
+        p.queue_prefetch("meaningful automatic query")
+        assert p._prefetch_thread is None
+        p._client.arecall.assert_not_called()
+
+        result = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "meaningful explicit query"}
+        ))["result"]
+        assert result == "1. explicit memory"
+        p._client.arecall.assert_called_once()
+
+    def test_route_aware_retain_keeps_profile_route_and_manual_tags(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            retain_tags=["profile:work", "shared"],
+            recall_routes={
+                "route-chat": {
+                    "retain_tags": ["domain:memory", "shared"],
+                }
+            },
+        )
+        p._chat_id = "route-chat"
+
+        p.handle_tool_call(
+            "hindsight_retain",
+            {"content": "manual memory", "tags": ["manual", "domain:memory"]},
+        )
+
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        assert item["tags"][:4] == [
+            "profile:work",
+            "shared",
+            "domain:memory",
+            "memory:manual",
+        ]
+        assert "source:manual-tool" in item["tags"]
+        assert "manual" in item["tags"]
+
+    def test_reflect_only_falls_back_when_synthesis_has_no_information(
+        self, provider_with_config
+    ):
+        p = provider_with_config(
+            recall_max_tokens=321,
+            recall_max_results=1,
+            recall_routes={
+                "memory": {
+                    "chat_ids": ["route-chat"],
+                    "tags": ["scope:memory"],
+                }
+            },
+        )
+        p._chat_id = "route-chat"
+        p._client.areflect.return_value = SimpleNamespace(
+            text="I don't have information about the old plan, but the current plan is useful."
+        )
+
+        useful = json.loads(p.handle_tool_call(
+            "hindsight_reflect", {"query": "memory plan"}
+        ))["result"]
+
+        assert "current plan is useful" in useful
+        p._client.arecall.assert_not_called()
+        assert p._client.areflect.call_args.kwargs["max_tokens"] == 321
+
+        p._client.areflect.reset_mock()
+        p._client.areflect.return_value = SimpleNamespace(
+            text="No relevant memories found."
+        )
+        p._client.arecall = AsyncMock(return_value=SimpleNamespace(results=[
+            {"id": "one", "text": "fallback one", "tags": ["scope:memory"]},
+            {"id": "two", "text": "fallback two", "tags": ["scope:memory"]},
+            {"id": "off", "text": "off domain", "tags": ["scope:other"]},
+        ]))
+
+        fallback = json.loads(p.handle_tool_call(
+            "hindsight_reflect", {"query": "memory plan"}
+        ))["result"]
+
+        assert "fallback one" in fallback
+        assert "fallback two" not in fallback
+        assert "off domain" not in fallback
+        assert p._client.arecall.call_args.kwargs["max_tokens"] == 321
+
+
 class TestPrefetch:
     def test_prefetch_returns_empty_when_no_result(self, provider):
         assert provider.prefetch("test") == ""
@@ -547,6 +911,77 @@ class TestProjectRouteGovernance:
         p._live_route_input = lambda: dict(p._trusted_route_input)
         p._client = _make_mock_client()
         return p
+
+    def test_project_route_can_disable_automatic_recall(
+        self, provider_with_config
+    ):
+        p = self._project_provider(
+            provider_with_config,
+            auto_recall=False,
+        )
+
+        p.queue_prefetch("meaningful project query")
+
+        assert p._prefetch_thread is None
+        p._client.arecall.assert_not_called()
+
+    def test_project_score_floor_falls_back_safely_for_old_client(
+        self, provider_with_config
+    ):
+        p = self._project_provider(
+            provider_with_config,
+            min_scores={"final": 0.6},
+        )
+        calls = []
+
+        async def legacy_arecall(
+            bank_id,
+            query,
+            budget="mid",
+            max_tokens=4096,
+            types=None,
+            tags=None,
+            tags_match="any",
+        ):
+            calls.append(query)
+            return SimpleNamespace(results=[
+                {
+                    "id": "low",
+                    "text": "low",
+                    "tags": [self.PROJECT_TAG],
+                    "scores": {"final": 0.5},
+                },
+                {
+                    "id": "high",
+                    "text": "high",
+                    "tags": [self.PROJECT_TAG],
+                    "scores": {"final": 0.7},
+                },
+                {
+                    "id": "unknown",
+                    "text": "unknown",
+                    "tags": [self.PROJECT_TAG],
+                },
+            ])
+
+        p._client.arecall = legacy_arecall
+
+        results = p._call_recall("scored project query", p._route_policy())
+
+        assert [result["text"] for result in results] == ["high"]
+        assert calls == ["scored project query"]
+
+    def test_text_route_cannot_select_a_legacy_project_scope(
+        self, provider_with_config
+    ):
+        p = provider_with_config(recall_routes={
+            "legacy-project": {
+                "keywords": ["project secret"],
+                "project_alias_tags": ["project:legacy"],
+            }
+        })
+
+        assert p._select_recall_route("project secret") is None
 
     def test_project_route_prefers_anchor_and_excludes_other_scopes(
         self, provider_with_config
@@ -1492,6 +1927,10 @@ class TestConfigSchema:
             "retain_user_prefix", "retain_assistant_prefix",
             "recall_tags", "recall_tags_match",
             "route_policy",
+            "recall_routes",
+            "recall_max_results", "recall_min_scores",
+            "recall_skip_low_signal_queries", "recall_low_signal_min_chars",
+            "recall_domain_signal_keywords",
             "auto_recall", "auto_retain",
             "retain_every_n_turns", "retain_async", "retain_context",
             "recall_max_tokens", "recall_max_input_chars",
