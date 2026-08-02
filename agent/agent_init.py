@@ -1705,18 +1705,18 @@ def init_agent(
                         _init_kwargs["agent_workspace"] = "hermes"
                     except Exception:
                         pass
-                    # Trusted memory routing metadata. Project identity is
-                    # resolved exclusively from the first-class Project store
-                    # against host/session cwd metadata; message text and
-                    # recalled context never participate. The cwd is included
-                    # so a provider may match an explicitly configured project
-                    # route when a registered task worktree lives outside the
-                    # Project's primary folder.
+                    # Trusted memory routing metadata. Controller Project
+                    # identity is resolved from the canonical root registry;
+                    # the per-profile Project store is compatibility-only.
+                    # Message text and recalled context never participate.
                     try:
                         from agent.runtime_cwd import resolve_agent_cwd
+                        from agent.project_identity import resolve_project_identity
 
-                        _route_cwd = str(resolve_agent_cwd())
+                        _runtime_cwd = str(resolve_agent_cwd())
+                        _route_cwd = _runtime_cwd
                         _route_source = "runtime_cwd"
+                        _repo_root = ""
                         _session_meta = None
                         if agent._session_db:
                             try:
@@ -1730,9 +1730,14 @@ def init_agent(
                             if _stored_cwd:
                                 _route_cwd = _stored_cwd
                                 _route_source = "session_metadata"
+                            _repo_root = str(
+                                _session_meta.get("git_repo_root") or ""
+                            ).strip()
 
                         _route_context = {
                             "cwd": _route_cwd,
+                            "runtime_cwd": _runtime_cwd,
+                            "git_repo_root": _repo_root,
                             "profile": _profile,
                             "platform": platform or "cli",
                             "session_id": agent.session_id or "",
@@ -1740,29 +1745,11 @@ def init_agent(
                             "thread_id": agent._thread_id or "",
                             "source": _route_source,
                         }
-                        from hermes_cli import projects_db as _projects_db
-
-                        _project = None
-                        if _projects_db.projects_db_path().exists():
-                            with _projects_db.connect_closing() as _project_conn:
-                                _project = _projects_db.project_for_path(
-                                    _project_conn, _route_cwd
-                                )
-                                if _project is None and isinstance(_session_meta, dict):
-                                    _repo_root = str(
-                                        _session_meta.get("git_repo_root") or ""
-                                    ).strip()
-                                    if _repo_root:
-                                        _project = _projects_db.project_for_path(
-                                            _project_conn, _repo_root
-                                        )
-                        if _project is not None:
-                            _route_context.update({
-                                "project_id": _project.id,
-                                "project_slug": _project.slug,
-                                "project_name": _project.name,
-                                "project_source": "projects_db",
-                            })
+                        _route_context.update(resolve_project_identity(
+                            session_cwd=_route_cwd,
+                            git_repo_root=_repo_root,
+                            runtime_cwd=_runtime_cwd,
+                        ))
                         _init_kwargs["route_context"] = _route_context
                     except Exception:
                         _ra().logger.debug(

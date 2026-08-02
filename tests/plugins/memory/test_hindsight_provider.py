@@ -541,6 +541,10 @@ class TestProjectRouteGovernance:
                 "cwd": "/workspace/hermes-agent",
             },
         )
+        # These route-governance tests run with Path.home() isolated to an
+        # empty temporary directory. Keep their synthetic host identity stable;
+        # live Controller refresh is exercised separately below.
+        p._live_route_input = lambda: dict(p._trusted_route_input)
         p._client = _make_mock_client()
         return p
 
@@ -669,6 +673,192 @@ class TestProjectRouteGovernance:
         assert not_inferred.route_name == "general"
         migrated = p._route_policy_config["projects"][self.PROJECT]
         assert "keywords" not in migrated.get("match", {})
+
+    def test_authoritative_host_project_rejects_other_chat_route(
+        self, provider_with_config
+    ):
+        p = provider_with_config(route_policy={
+            "projects": {
+                self.PROJECT: {"max_results": 2},
+                "other-project": {
+                    "max_results": 9,
+                    "match": {"chat_ids": ["shared-chat"]},
+                },
+            }
+        })
+
+        context = p._resolve_route_context({
+            "project_id": self.PROJECT,
+            "project_slug": self.PROJECT,
+            "project_name": "Hermes Agent Engineering",
+            "project_source": "controller_registry",
+            "chat_id": "shared-chat",
+        })
+
+        assert context.project_tag == self.PROJECT_TAG
+        assert context.source == "controller_registry"
+        assert p._route_policy(context).max_results == 2
+
+    def test_invalid_controller_registry_fails_closed_to_general_route(
+        self, provider_with_config
+    ):
+        p = provider_with_config(route_policy={
+            "projects": {
+                "other-project": {
+                    "match": {"chat_ids": ["matched-chat"]},
+                }
+            }
+        })
+
+        context = p._resolve_route_context({
+            "project_source": "controller_registry_invalid",
+            "project_match": "invalid",
+            "chat_id": "matched-chat",
+        })
+
+        assert context.route_name == "general"
+        assert context.project_tag == ""
+        assert context.source == "controller_registry_invalid"
+
+    def test_live_route_refresh_uses_shared_project_resolver(
+        self, provider_with_config, monkeypatch, tmp_path
+    ):
+        p = provider_with_config()
+        runtime_cwd = tmp_path / "runtime-workspace"
+        runtime_cwd.mkdir()
+        identity = {
+            "project_id": self.PROJECT,
+            "project_slug": self.PROJECT,
+            "project_name": "Hermes Agent Engineering",
+            "project_source": "controller_registry",
+            "project_match": "execution_workspace",
+        }
+        calls = []
+
+        def resolve_identity(**kwargs):
+            calls.append(kwargs)
+            return identity
+
+        monkeypatch.setattr(
+            "agent.runtime_cwd.resolve_agent_cwd", lambda: runtime_cwd
+        )
+        monkeypatch.setattr(
+            "agent.project_identity.resolve_project_identity", resolve_identity
+        )
+
+        refreshed = p._live_route_input()
+
+        assert refreshed["project_slug"] == self.PROJECT
+        assert refreshed["project_source"] == "controller_registry"
+        assert calls == [{
+            "session_cwd": str(runtime_cwd),
+            "git_repo_root": "",
+            "runtime_cwd": str(runtime_cwd),
+        }]
+
+    def test_legacy_project_aliases_are_separate_or_scopes_and_preserve_tags(
+        self, provider_with_config
+    ):
+        alias = "project:hermes-memory-optimization"
+        retained_alias = "project:memory-optimization-legacy"
+        required_scope_tags = {
+            "scope:memory",
+            "history:optimized",
+            "source:legacy-route",
+        }
+        p = provider_with_config(
+            recall_routes={
+                "Memory 优化": {
+                    "project_slug": self.PROJECT,
+                    "required_tags": [self.PROJECT_TAG, "scope:memory"],
+                    "tags": [alias, "history:optimized"],
+                    "retain_tags": [retained_alias, "source:legacy-route"],
+                    "chat_ids": ["memory-optimization-chat"],
+                    "priority_tags": ["memory:durable-decision"],
+                    "max_results": 8,
+                }
+            }
+        )
+        context = p._resolve_route_context({
+            "chat_id": "memory-optimization-chat",
+            "profile": "coding",
+        })
+        p._route_context = context
+        migrated = p._route_policy_config["projects"][self.PROJECT]
+        policy = p._route_policy(context)
+
+        assert migrated["project_alias_tags"] == [alias, retained_alias]
+        assert migrated["required_tags"] == [
+            "scope:memory", "history:optimized", "source:legacy-route"
+        ]
+        assert migrated["retain_project_alias_tags"] == [retained_alias]
+        assert policy.canonical_project_tag == self.PROJECT_TAG
+        assert policy.project_alias_tags == (alias, retained_alias)
+        assert set(policy.required_tags) == required_scope_tags
+
+        def recalled_for_scope(**kwargs):
+            query_tags = set(kwargs.get("tags") or [])
+            project_scope = next(
+                tag for tag in query_tags if tag.startswith("project:")
+            )
+            return SimpleNamespace(results=[
+                _memory_result(
+                    f"memory for {project_scope}",
+                    [project_scope, *required_scope_tags,
+                     "memory:durable-decision"],
+                    result_id=project_scope,
+                ),
+                _memory_result(
+                    "foreign project memory",
+                    ["project:unrelated", *required_scope_tags,
+                     "memory:durable-decision"],
+                    result_id="foreign",
+                ),
+            ])
+
+        p._client.arecall.side_effect = recalled_for_scope
+        results = p._recall_with_policy("What changed in memory routing?", policy)
+
+        assert {result.id for result in results} == {
+            self.PROJECT_TAG, alias, retained_alias
+        }
+        calls = p._client.arecall.call_args_list
+        assert len(calls) == 6
+        queried_scopes = []
+        for call in calls:
+            project_tags = [
+                tag for tag in call.kwargs["tags"]
+                if tag.startswith("project:")
+            ]
+            assert len(project_tags) == 1
+            assert call.kwargs["tags_match"] == "all_strict"
+            assert required_scope_tags <= set(call.kwargs["tags"])
+            queried_scopes.extend(project_tags)
+        assert set(queried_scopes) == {
+            self.PROJECT_TAG, alias, retained_alias
+        }
+
+        automatic_tags = set(p._retain_route_tags("session_observation"))
+        metadata = p._build_metadata(
+            message_count=2,
+            turn_index=1,
+            memory_kind="session_observation",
+        )
+        assert self.PROJECT_TAG in automatic_tags
+        assert retained_alias in automatic_tags
+        assert alias not in automatic_tags
+        assert required_scope_tags <= automatic_tags
+        assert metadata["project_alias_tags"] == retained_alias
+
+        p.handle_tool_call("hindsight_retain", {
+            "content": "manual note",
+            "tags": [alias, "project:forged-alias"],
+        })
+        manual_item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        assert self.PROJECT_TAG in manual_item["tags"]
+        assert retained_alias in manual_item["tags"]
+        assert alias not in manual_item["tags"]
+        assert "project:forged-alias" not in manual_item["tags"]
 
     def test_low_signal_skips_but_meaningful_query_queues(
         self, provider_with_config

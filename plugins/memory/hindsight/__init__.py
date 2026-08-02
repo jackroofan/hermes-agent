@@ -791,6 +791,9 @@ class _RoutePolicy:
     tags: tuple[str, ...]
     tags_match: str
     required_tags: tuple[str, ...]
+    canonical_project_tag: str
+    project_alias_tags: tuple[str, ...]
+    retain_project_alias_tags: tuple[str, ...]
     exclude_tags: tuple[str, ...]
     priority_tags: tuple[str, ...]
     max_results: int
@@ -839,6 +842,61 @@ def _normalize_min_scores(value: Any) -> dict[str, float] | None:
     return normalized or None
 
 
+def _normalize_project_tag(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.startswith("project:"):
+        text = text.split(":", 1)[1]
+    key = _sanitize_bank_segment(text).lower()
+    return f"project:{key}" if key else ""
+
+
+def _route_project_tags(
+    key: str, route: dict[str, Any]
+) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    """Return canonical, recall-alias, and retain-alias Project tags."""
+    explicit = route.get("project_slug") or route.get("project_id")
+    canonical = _normalize_project_tag(explicit)
+    discovered: list[str] = []
+    for field in ("required_tags", "tags", "retain_tags"):
+        for tag in _normalize_retain_tags(route.get(field)):
+            if tag.startswith("project:"):
+                normalized = _normalize_project_tag(tag)
+                if normalized and normalized not in discovered:
+                    discovered.append(normalized)
+    for field in ("project_alias_tags", "project_aliases"):
+        for alias in _normalize_retain_tags(route.get(field)):
+            normalized = _normalize_project_tag(alias)
+            if normalized and normalized not in discovered:
+                discovered.append(normalized)
+    if not canonical and discovered:
+        canonical = discovered[0]
+    if not canonical:
+        canonical = _normalize_project_tag(key)
+    aliases = tuple(tag for tag in discovered if tag != canonical)
+
+    explicit_retain_aliases: list[str] = []
+    for tag in _normalize_retain_tags(route.get("retain_project_alias_tags")):
+        normalized = _normalize_project_tag(tag)
+        if normalized in aliases and normalized not in explicit_retain_aliases:
+            explicit_retain_aliases.append(normalized)
+    for tag in _normalize_retain_tags(route.get("retain_tags")):
+        normalized = _normalize_project_tag(tag) if tag.startswith("project:") else ""
+        if normalized in aliases and normalized not in explicit_retain_aliases:
+            explicit_retain_aliases.append(normalized)
+    return canonical, aliases, tuple(explicit_retain_aliases)
+
+
+def _legacy_non_project_scope_tags(route: dict[str, Any]) -> list[str]:
+    tags: list[str] = []
+    for field in ("required_tags", "tags", "retain_tags"):
+        for tag in _normalize_retain_tags(route.get(field)):
+            if not tag.startswith("project:") and tag not in tags:
+                tags.append(tag)
+    return tags
+
+
 def _legacy_route_policy(config: dict[str, Any]) -> dict[str, Any]:
     """Translate older route knobs into the canonical ``route_policy`` shape.
 
@@ -874,27 +932,46 @@ def _legacy_route_policy(config: dict[str, Any]) -> dict[str, Any]:
             continue
         project_slug = str(raw.get("project_slug") or "").strip()
         project_id = str(raw.get("project_id") or "").strip()
-        if not (project_slug or project_id):
-            candidate_tags = _normalize_retain_tags(
-                raw.get("required_tags") or raw.get("tags") or raw.get("retain_tags")
-            )
-            project_tag = next(
-                (tag for tag in candidate_tags if tag.startswith("project:")), ""
-            )
-            if project_tag:
-                project_slug = project_tag.split(":", 1)[1]
+        discovered_project_tags: list[str] = []
+        for field in ("required_tags", "tags", "retain_tags"):
+            for tag in _normalize_retain_tags(raw.get(field)):
+                if tag.startswith("project:"):
+                    normalized = _normalize_project_tag(tag)
+                    if normalized and normalized not in discovered_project_tags:
+                        discovered_project_tags.append(normalized)
+        if not (project_slug or project_id) and discovered_project_tags:
+            project_slug = discovered_project_tags[0].split(":", 1)[1]
         if not (project_slug or project_id):
             continue
         project_key = project_slug or project_id or str(key)
         migrated = {
             name: copy.deepcopy(raw[name])
             for name in (
-                "required_tags", "priority_tags", "exclude_tags",
+                "priority_tags", "exclude_tags",
                 "excluded_tags", "max_results", "min_scores",
                 "skip_low_signal", "low_signal_min_chars",
             )
             if name in raw
         }
+        canonical_tag = _normalize_project_tag(project_slug or project_id)
+        alias_tags = [
+            tag for tag in discovered_project_tags if tag != canonical_tag
+        ]
+        retain_alias_tags = [
+            _normalize_project_tag(tag)
+            for tag in _normalize_retain_tags(raw.get("retain_tags"))
+            if tag.startswith("project:")
+            and _normalize_project_tag(tag) in alias_tags
+        ]
+        non_project_tags = _legacy_non_project_scope_tags(raw)
+        if non_project_tags:
+            migrated["required_tags"] = non_project_tags
+        if alias_tags:
+            migrated["project_alias_tags"] = alias_tags
+        if retain_alias_tags:
+            migrated["retain_project_alias_tags"] = list(dict.fromkeys(
+                retain_alias_tags
+            ))
         migrated.update({
             "project_slug": project_slug,
             "project_id": project_id,
@@ -1305,7 +1382,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_assistant_prefix", "description": "Label used before assistant turns in retained transcripts", "default": "Assistant"},
             {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
             {"key": "recall_tags_match", "description": "Tag matching mode for general recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict", "exact"]},
-            {"key": "route_policy", "description": "Trusted project/general routing policy as JSON. Project routes may match exact host paths/session/chat/thread ids and configure required, priority, excluded tags, max_results, low-signal handling, and optional 0.8.6 min_scores. Query text is never used to select a project.", "default": ""},
+            {"key": "route_policy", "description": "Trusted project/general routing policy as JSON. Project routes have one canonical project, may declare project_alias_tags for legacy recall and retain_project_alias_tags for explicit compatibility retains, and may match exact host paths/session/chat/thread ids. Query text is never used to select a project.", "default": ""},
             {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "auto_retain", "description": "Automatically retain conversation turns", "default": True},
@@ -1827,6 +1904,23 @@ class HindsightMemoryProvider(MemoryProvider):
         return []
 
     @staticmethod
+    def _configured_project_keys(
+        key: str, route: dict[str, Any]
+    ) -> set[str]:
+        canonical, aliases, _ = _route_project_tags(key, route)
+        values = {
+            key.casefold(),
+            str(route.get("project_id") or "").strip().casefold(),
+            str(route.get("project_slug") or "").strip().casefold(),
+        }
+        values.update(
+            tag.split(":", 1)[1].casefold()
+            for tag in (canonical, *aliases)
+            if tag
+        )
+        return values - {""}
+
+    @staticmethod
     def _path_matches(cwd: str, configured_path: str) -> bool:
         if not cwd or not configured_path:
             return False
@@ -1854,13 +1948,15 @@ class HindsightMemoryProvider(MemoryProvider):
 
         entries = self._project_route_entries()
         for key, route in entries:
-            configured_keys = {
-                key.casefold(),
-                str(route.get("project_id") or "").strip().casefold(),
-                str(route.get("project_slug") or "").strip().casefold(),
-            } - {""}
+            configured_keys = self._configured_project_keys(key, route)
             if host_project_keys & configured_keys:
                 return key, route
+
+        # A host-resolved Project is authoritative. Chat/thread/path matchers
+        # may refine only a route that explicitly names that same parent (or a
+        # declared alias, handled above); they cannot replace it.
+        if host_project_keys:
+            return None
 
         for key, route in entries:
             match = route.get("match") if isinstance(route.get("match"), dict) else route
@@ -1879,16 +1975,26 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _resolve_route_context(self, host: dict[str, Any]) -> _RouteContext:
         host = host if isinstance(host, dict) else {}
-        configured = self._matching_configured_project(host)
+        source = str(
+            host.get("project_source") or host.get("source") or ""
+        ).strip()
+        configured = (
+            None
+            if source == "controller_registry_invalid"
+            else self._matching_configured_project(host)
+        )
         project_id = str(host.get("project_id") or "").strip()
         project_slug = str(host.get("project_slug") or "").strip()
         project_name = str(host.get("project_name") or "").strip()
-        source = str(host.get("project_source") or host.get("source") or "").strip()
-        if configured is not None:
+        if configured is not None and not (project_id or project_slug):
             key, route = configured
+            canonical_tag, _, _ = _route_project_tags(key, route)
             project_id = str(route.get("project_id") or project_id).strip()
             project_slug = str(
-                route.get("project_slug") or project_slug or key
+                route.get("project_slug")
+                or project_slug
+                or canonical_tag.split(":", 1)[-1]
+                or key
             ).strip()
             project_name = str(route.get("project_name") or project_name).strip()
             source = "provider_config"
@@ -1913,40 +2019,30 @@ class HindsightMemoryProvider(MemoryProvider):
         host.setdefault("profile", self._agent_identity)
         host["session_id"] = self._session_id
         try:
+            from agent.project_identity import resolve_project_identity
             from agent.runtime_cwd import resolve_agent_cwd
 
             cwd = str(resolve_agent_cwd())
             if cwd:
-                host["cwd"] = cwd
-            from hermes_cli import projects_db as projects_db
-
-            projects_path = Path(self._hermes_home) / "projects.db"
-            if projects_path.exists():
-                with projects_db.connect_closing(db_path=projects_path) as conn:
-                    project = projects_db.project_for_path(conn, cwd)
-                if project is not None:
-                    host.update({
-                        "project_id": project.id,
-                        "project_slug": project.slug,
-                        "project_name": project.name,
-                        "project_source": "projects_db",
-                    })
-                elif host.get("project_source") == "projects_db":
-                    for key in (
-                        "project_id", "project_slug", "project_name", "project_source"
-                    ):
-                        host.pop(key, None)
+                host["runtime_cwd"] = cwd
+                host.setdefault("cwd", cwd)
+            for key in (
+                "project_id", "project_slug", "project_name",
+                "project_source", "project_match",
+            ):
+                host.pop(key, None)
+            host.update(resolve_project_identity(
+                session_cwd=str(host.get("cwd") or ""),
+                git_repo_root=str(host.get("git_repo_root") or ""),
+                runtime_cwd=str(host.get("runtime_cwd") or cwd or ""),
+            ))
         except Exception:
             logger.debug("Hindsight trusted route refresh failed", exc_info=True)
         return host
 
     def _project_route_config(self, context: _RouteContext) -> dict[str, Any]:
         for key, route in self._project_route_entries():
-            configured_keys = {
-                key.casefold(),
-                str(route.get("project_id") or "").strip().casefold(),
-                str(route.get("project_slug") or "").strip().casefold(),
-            } - {""}
+            configured_keys = self._configured_project_keys(key, route)
             if {
                 context.project_id.casefold(), context.project_slug.casefold()
             } & configured_keys:
@@ -1957,8 +2053,27 @@ class HindsightMemoryProvider(MemoryProvider):
         context = context or self._route_context
         if context.project_tag:
             route = self._project_route_config(context)
-            tags = [context.project_tag]
-            tags.extend(_normalize_retain_tags(route.get("required_tags")))
+            route_key = context.project_slug or context.project_id
+            route_canonical, route_aliases, _ = _route_project_tags(
+                route_key, route
+            )
+            alias_tags = tuple(dict.fromkeys(
+                tag for tag in (route_canonical, *route_aliases)
+                if tag and tag != context.project_tag
+            ))
+            required_tags = tuple(_legacy_non_project_scope_tags(route))
+            retain_alias_candidates = [
+                *_normalize_retain_tags(route.get("retain_project_alias_tags")),
+                *[
+                    tag for tag in _normalize_retain_tags(route.get("retain_tags"))
+                    if tag.startswith("project:")
+                ],
+            ]
+            retain_alias_tags = tuple(dict.fromkeys(
+                normalized
+                for value in retain_alias_candidates
+                if (normalized := _normalize_project_tag(value)) in alias_tags
+            ))
             exclude_tags = _normalize_retain_tags(
                 route.get("exclude_tags") or route.get("excluded_tags")
             )
@@ -1968,9 +2083,12 @@ class HindsightMemoryProvider(MemoryProvider):
             return _RoutePolicy(
                 name=context.route_name,
                 project_scoped=True,
-                tags=tuple(dict.fromkeys(tags)),
+                tags=(context.project_tag, *required_tags),
                 tags_match="all_strict",
-                required_tags=(context.project_tag,),
+                required_tags=required_tags,
+                canonical_project_tag=context.project_tag,
+                project_alias_tags=alias_tags,
+                retain_project_alias_tags=retain_alias_tags,
                 exclude_tags=tuple(exclude_tags),
                 priority_tags=tuple(priority_tags),
                 max_results=_bounded_int(
@@ -1999,6 +2117,9 @@ class HindsightMemoryProvider(MemoryProvider):
             tags=tuple(tags),
             tags_match=tags_match,
             required_tags=(),
+            canonical_project_tag="",
+            project_alias_tags=(),
+            retain_project_alias_tags=(),
             exclude_tags=tuple(_normalize_retain_tags(route.get("exclude_tags"))),
             priority_tags=tuple(_normalize_retain_tags(route.get("priority_tags"))),
             max_results=_bounded_int(
@@ -2086,7 +2207,14 @@ class HindsightMemoryProvider(MemoryProvider):
                 if not set(policy.required_tags) <= tags:
                     continue
                 project_tags = {tag for tag in tags if tag.startswith("project:")}
-                if project_tags - {self._route_context.project_tag}:
+                allowed_project_tags = {
+                    policy.canonical_project_tag, *policy.project_alias_tags
+                } - {""}
+                if (
+                    not project_tags
+                    or not (project_tags & allowed_project_tags)
+                    or project_tags - allowed_project_tags
+                ):
                     continue
                 domain_tags = {tag for tag in tags if tag.startswith("domain:")}
                 configured_domains = {
@@ -2134,6 +2262,7 @@ class HindsightMemoryProvider(MemoryProvider):
         query: str,
         policy: _RoutePolicy,
         *,
+        project_scope_tag: str = "",
         additional_required_tags: tuple[str, ...] = (),
     ) -> list[Any]:
         base_kwargs: dict[str, Any] = {
@@ -2149,11 +2278,22 @@ class HindsightMemoryProvider(MemoryProvider):
         # operation runner owns client acquisition and embedded reconnects.
         client = self._client if self._client is not None else self._get_client()
         kwargs = dict(base_kwargs)
-        required_tags = tuple(dict.fromkeys((*policy.tags, *additional_required_tags)))
+        if policy.project_scoped:
+            required_tags = tuple(dict.fromkeys((
+                project_scope_tag or policy.canonical_project_tag,
+                *policy.required_tags,
+                *additional_required_tags,
+            )))
+        else:
+            required_tags = tuple(dict.fromkeys((
+                *policy.tags, *additional_required_tags
+            )))
         if required_tags:
             kwargs["tags"] = list(required_tags)
             kwargs["tags_match"] = (
-                "all_strict" if additional_required_tags else policy.tags_match
+                "all_strict"
+                if policy.project_scoped or additional_required_tags
+                else policy.tags_match
             )
         if policy.min_scores and _supports_keyword(client.arecall, "min_scores"):
             kwargs["min_scores"] = dict(policy.min_scores)
@@ -2182,19 +2322,29 @@ class HindsightMemoryProvider(MemoryProvider):
     ) -> list[Any]:
         policy = policy or self._route_policy()
         priority_results: list[Any] = []
+        project_scopes = (
+            (policy.canonical_project_tag, *policy.project_alias_tags)
+            if policy.project_scoped else ("",)
+        )
         if policy.project_scoped and policy.priority_tags:
             # 0.8.6's published wheel advertises tag_groups but omits the
             # generated model it imports when that argument is used. Query
             # each priority tag with the exact project scope instead. This is
             # also compatible with older clients and still reserves the front
             # of the local result budget for anchors/durable decisions.
-            for priority_tag in policy.priority_tags:
-                priority_results.extend(self._call_recall(
-                    query,
-                    policy,
-                    additional_required_tags=(priority_tag,),
-                ))
-        broad_results = self._call_recall(query, policy)
+            for project_scope in project_scopes:
+                for priority_tag in policy.priority_tags:
+                    priority_results.extend(self._call_recall(
+                        query,
+                        policy,
+                        project_scope_tag=project_scope,
+                        additional_required_tags=(priority_tag,),
+                    ))
+        broad_results: list[Any] = []
+        for project_scope in project_scopes:
+            broad_results.extend(self._call_recall(
+                query, policy, project_scope_tag=project_scope
+            ))
         return self._filter_route_results(
             [*priority_results, *broad_results], policy
         )
@@ -2461,6 +2611,11 @@ class HindsightMemoryProvider(MemoryProvider):
             metadata["project_id"] = self._route_context.project_id
         if self._route_context.project_slug:
             metadata["project_slug"] = self._route_context.project_slug
+        policy = self._route_policy()
+        if policy.retain_project_alias_tags:
+            metadata["project_alias_tags"] = ",".join(
+                policy.retain_project_alias_tags
+            )
         return metadata
 
     def _retain_route_tags(self, memory_kind: str) -> list[str]:
@@ -2472,9 +2627,12 @@ class HindsightMemoryProvider(MemoryProvider):
             if tag not in _RESERVED_MEMORY_KIND_TAGS
             and not tag.startswith(("project:", "domain:", "profile:", "source:"))
         ]
+        policy = self._route_policy()
         for tag in (
             self._route_context.profile_tag,
             self._route_context.project_tag,
+            *policy.retain_project_alias_tags,
+            *policy.required_tags,
             (
                 f"domain:{self._route_context.project_key}"
                 if self._route_context.project_key else ""

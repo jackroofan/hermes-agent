@@ -79,7 +79,10 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             default="",
             description=(
                 "Optional JSON for trusted project routes and the bounded "
-                "general fallback. Project selection uses host metadata only."
+                "general fallback. Each route has one canonical project and "
+                "may declare project_alias_tags for legacy recall plus "
+                "retain_project_alias_tags when compatibility retains must "
+                "carry an alias. Project selection uses host metadata only."
             ),
             inline=True,
         ),

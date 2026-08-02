@@ -1,6 +1,5 @@
 """Regression tests for memory provider selection during AIAgent init."""
 
-from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -96,16 +95,16 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
     assert "status_callback" not in provider.init_kwargs
 
 
-def test_aiagent_forwards_trusted_first_class_project_route(tmp_path):
+def test_aiagent_forwards_trusted_first_class_project_route():
     provider = RecordingMemoryProvider()
     cfg = {"memory": {"provider": "recording"}, "agent": {}}
-    projects_path = tmp_path / "projects.db"
-    projects_path.touch()
-    project = SimpleNamespace(
-        id="p_hermes",
-        slug="hermes-agent-engineering",
-        name="Hermes Agent Engineering",
-    )
+    identity = {
+        "project_id": "hermes-agent-engineering",
+        "project_slug": "hermes-agent-engineering",
+        "project_name": "Hermes Agent Engineering",
+        "project_source": "controller_registry",
+        "project_match": "execution_workspace",
+    }
 
     with (
         patch("hermes_cli.config.load_config", return_value=cfg),
@@ -117,9 +116,10 @@ def test_aiagent_forwards_trusted_first_class_project_route(tmp_path):
         patch("run_agent.OpenAI"),
         patch("agent.runtime_cwd.resolve_agent_cwd", return_value=Path("/trusted/repo")),
         patch("hermes_cli.profiles.get_active_profile_name", return_value="coding"),
-        patch("hermes_cli.projects_db.projects_db_path", return_value=projects_path),
-        patch("hermes_cli.projects_db.connect_closing", return_value=nullcontext(object())),
-        patch("hermes_cli.projects_db.project_for_path", return_value=project),
+        patch(
+            "agent.project_identity.resolve_project_identity",
+            return_value=identity,
+        ) as resolve_identity,
     ):
         from run_agent import AIAgent
 
@@ -135,11 +135,17 @@ def test_aiagent_forwards_trusted_first_class_project_route(tmp_path):
 
     route = provider.init_kwargs["route_context"]
     assert agent._memory_manager is not None
-    assert route["project_id"] == "p_hermes"
+    assert route["project_id"] == "hermes-agent-engineering"
     assert route["project_slug"] == "hermes-agent-engineering"
     assert route["profile"] == "coding"
     assert route["source"] == "runtime_cwd"
-    assert route["project_source"] == "projects_db"
+    assert route["project_source"] == "controller_registry"
+    assert route["project_match"] == "execution_workspace"
+    resolve_identity.assert_called_once_with(
+        session_cwd="/trusted/repo",
+        git_repo_root="",
+        runtime_cwd="/trusted/repo",
+    )
 
 
 class CoreShadowProvider:
@@ -182,4 +188,3 @@ def test_core_tool_names_rejected_from_memory_routing_table():
     assert "clarify" not in schema_names
     assert "delegate_task" not in schema_names
     assert "honcho_search" in schema_names
-
