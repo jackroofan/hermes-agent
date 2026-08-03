@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import threading
 import types
+from contextlib import nullcontext
+from contextvars import copy_context
+from dataclasses import FrozenInstanceError, replace
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -17,6 +21,25 @@ import pytest
 from agent.context_compressor import ContextCompressor
 from agent.turn_context import TurnContext, build_turn_context
 from hermes_state import SessionDB
+
+from agent.intent_capability import (
+    ApprovedAddendum,
+    AuthorityConstraint,
+    AuthorityDenied,
+    CapabilityLookup,
+    ExactScope,
+    InputProvenance,
+    OneGoalTaskAuthority,
+    ParentObjective,
+    TaskBinding,
+    activate_turn_authority,
+    audit_intent_capability,
+    bind_trusted_input,
+    current_direct_user_receipt,
+    current_intent_capability_ledger,
+    digest_text,
+    issue_intent_capability,
+)
 
 
 class _FakeTodoStore:
@@ -197,6 +220,35 @@ def _build(agent, **overrides):
     return build_turn_context(**kwargs)
 
 
+def _intent_authority(*, goals=("implement G4",), task_hash=None):
+    objective = ParentObjective.from_content("objective-1", "Repair Hermes safely")
+    addendum = ApprovedAddendum.from_content(
+        "addendum-1", objective.objective_id, "G4 is approved"
+    )
+    scope = ExactScope.from_content(
+        "Intent-bound capability issuer only",
+        ("No repository-write routing", "No deployment"),
+    )
+    task_content = '{"task":"g4"}'
+    binding = TaskBinding.from_content(
+        project_id="hermes-agent-engineering",
+        component="core-agent-runtime",
+        canonical_repository="/repo/hermes-agent",
+        execution_repository="/repo/hermes-g4",
+        task_id="g4-task",
+        task_content=task_content,
+        task_hash=digest_text(task_content) if task_hash is None else task_hash,
+        scope=scope,
+        constraints=(AuthorityConstraint.from_value("single_writer", "codex"),),
+    )
+    return OneGoalTaskAuthority(
+        parent_objective=objective,
+        approved_addendum=addendum,
+        goals=tuple(goals),
+        task=binding,
+    )
+
+
 def test_returns_turn_context_with_user_message_appended():
     agent = _FakeAgent()
     ctx = _build(agent)
@@ -333,13 +385,424 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
 
 
+def test_intent_capability_missing_provenance_is_denied():
+    with activate_turn_authority(
+        session_id="session-1",
+        turn_id="turn-1",
+        platform="cli",
+        clean_user_message="ship G4",
+    ):
+        assert current_direct_user_receipt() is None
+        with pytest.raises(AuthorityDenied):
+            issue_intent_capability(_intent_authority())
 
 
+@pytest.mark.parametrize(
+    "origin",
+    [
+        InputProvenance.UNCLASSIFIED,
+        InputProvenance.INTERNAL,
+        InputProvenance.BACKGROUND,
+        InputProvenance.CRON,
+        InputProvenance.COMPACTION,
+        InputProvenance.TODO,
+        InputProvenance.MEMORY,
+        InputProvenance.REVIEW,
+        InputProvenance.MIGRATION,
+        InputProvenance.BOOTSTRAP,
+        InputProvenance.SYNTHETIC,
+        InputProvenance.RELAY,
+        InputProvenance.SUBAGENT,
+        InputProvenance.REPLAY_ONLY,
+        InputProvenance.WEBHOOK,
+        "direct_user_cli",
+    ],
+)
+def test_direct_user_authority_denies_non_user_origins(origin):
+    with bind_trusted_input(
+        origin=origin,
+        session_id="session-1",
+        platform="cli",
+        source_identity="source-1",
+        clean_user_message="ship G4",
+    ):
+        with activate_turn_authority(
+            session_id="session-1",
+            turn_id="turn-1",
+            platform="cli",
+            clean_user_message="ship G4",
+        ):
+            assert current_direct_user_receipt() is None
+            with pytest.raises(AuthorityDenied):
+                issue_intent_capability(_intent_authority())
 
 
+@pytest.mark.parametrize(
+    ("origin", "platform"),
+    [
+        (InputProvenance.DIRECT_USER_CLI, "api_server"),
+        (InputProvenance.DIRECT_USER_GATEWAY, "unknown_plugin"),
+        (InputProvenance.DIRECT_USER_API, "cli"),
+        (InputProvenance.DIRECT_USER_ACP, "gateway"),
+    ],
+)
+def test_direct_user_authority_denies_source_platform_substitution(origin, platform):
+    with bind_trusted_input(
+        origin=origin,
+        session_id="session-1",
+        platform=platform,
+        source_identity="source-1",
+        clean_user_message="ship G4",
+    ):
+        with activate_turn_authority(
+            session_id="session-1",
+            turn_id="turn-1",
+            platform=platform,
+            clean_user_message="ship G4",
+        ):
+            assert current_direct_user_receipt() is None
 
 
+def test_direct_user_authority_mints_one_exact_capability_and_cleans_up():
+    with bind_trusted_input(
+        origin=InputProvenance.DIRECT_USER_CLI,
+        session_id="session-1",
+        platform="cli",
+        source_identity="terminal-1",
+        clean_user_message="ship G4",
+    ):
+        with activate_turn_authority(
+            session_id="session-1",
+            turn_id="turn-1",
+            platform="cli",
+            clean_user_message="ship G4",
+        ):
+            receipt = current_direct_user_receipt()
+            assert receipt is not None
+            assert receipt.session_id == "session-1"
+            assert receipt.turn_id == "turn-1"
+            assert b"ship G4" not in receipt.canonical_bytes
+
+            ledger = current_intent_capability_ledger()
+            capability = issue_intent_capability(_intent_authority())
+            lookup = CapabilityLookup.from_capability(capability)
+            assert ledger.exact_lookup(lookup) == capability
+            assert ledger.revalidate(capability, lookup) is True
+            mismatched_lookups = (
+                replace(lookup, project_id="other-project"),
+                replace(lookup, canonical_repository="/repo/other"),
+                replace(lookup, execution_repository="/workspace/other"),
+                replace(lookup, session_id="other-session"),
+                replace(lookup, turn_id="other-turn"),
+                replace(lookup, task_id="other-task"),
+                replace(lookup, task_hash="0" * 64),
+                replace(lookup, capability_digest="0" * 64),
+                replace(lookup, status="revoked"),
+            )
+            assert all(
+                ledger.exact_lookup(forged) is None
+                for forged in mismatched_lookups
+            )
+            evidence = audit_intent_capability(capability)
+            assert evidence.constraint_names == ("single_writer",)
+            assert "Repair Hermes safely" not in repr(evidence)
+            assert "ship G4" not in repr(evidence)
+            assert "/repo/hermes-g4" not in repr(evidence)
+            with pytest.raises(AuthorityDenied):
+                issue_intent_capability(_intent_authority())
+
+        assert ledger.exact_lookup(lookup) is None
+        assert ledger.revalidate(capability, lookup) is False
+        assert current_direct_user_receipt() is None
 
 
+def test_intent_capability_rejects_zero_or_multiple_goals_and_hash_mismatch():
+    valid = _intent_authority()
+    invalid = [
+        _intent_authority(goals=()),
+        _intent_authority(goals=("g1", "g2")),
+        _intent_authority(task_hash=""),
+        _intent_authority(task_hash="0" * 64),
+        replace(valid, schema_version=999),
+        replace(
+            valid,
+            parent_objective=replace(
+                valid.parent_objective, content_digest="not-a-digest"
+            ),
+        ),
+        replace(
+            valid,
+            task=replace(
+                valid.task,
+                scope=replace(
+                    valid.task.scope,
+                    exclusions=(),
+                    exclusions_digest=digest_text("[]"),
+                ),
+            ),
+        ),
+    ]
+    with bind_trusted_input(
+        origin=InputProvenance.DIRECT_USER_CLI,
+        session_id="session-1",
+        platform="cli",
+        source_identity="terminal-1",
+        clean_user_message="ship G4",
+    ):
+        for index, authority in enumerate(invalid):
+            with activate_turn_authority(
+                session_id="session-1",
+                turn_id=f"turn-{index}",
+                platform="cli",
+                clean_user_message="ship G4",
+            ):
+                with pytest.raises(AuthorityDenied):
+                    issue_intent_capability(authority)
 
 
+def test_intent_capability_rejects_content_digest_mismatch_and_stale_record():
+    authority = _intent_authority()
+    forged_objective = replace(
+        authority.parent_objective, content_digest="0" * 64
+    )
+    forged_authority = replace(authority, parent_objective=forged_objective)
+
+    with bind_trusted_input(
+        origin=InputProvenance.DIRECT_USER_CLI,
+        session_id="session-1",
+        platform="cli",
+        source_identity="terminal-1",
+        clean_user_message="ship G4",
+    ):
+        with activate_turn_authority(
+            session_id="session-1",
+            turn_id="turn-1",
+            platform="cli",
+            clean_user_message="ship G4",
+        ):
+            with pytest.raises(AuthorityDenied):
+                issue_intent_capability(forged_authority)
+            capability = issue_intent_capability(authority)
+            lookup = CapabilityLookup.from_capability(capability)
+            ledger = current_intent_capability_ledger()
+            with patch(
+                "agent.intent_capability.time.time_ns",
+                return_value=capability.expires_at_ns + 1,
+            ):
+                assert ledger.exact_lookup(lookup) is None
+                assert ledger.revalidate(capability, lookup) is False
+
+
+def test_direct_user_authority_rejects_cross_session_message_and_turn_reuse():
+    with bind_trusted_input(
+        origin=InputProvenance.DIRECT_USER_CLI,
+        session_id="session-1",
+        platform="cli",
+        source_identity="terminal-1",
+        clean_user_message="ship G4",
+    ):
+        for session_id, message in [
+            ("session-2", "ship G4"),
+            ("session-1", "different message"),
+        ]:
+            with activate_turn_authority(
+                session_id=session_id,
+                turn_id="turn-wrong",
+                platform="cli",
+                clean_user_message=message,
+            ):
+                assert current_direct_user_receipt() is None
+
+        with activate_turn_authority(
+            session_id="session-1",
+            turn_id="turn-1",
+            platform="cli",
+            clean_user_message="ship G4",
+        ):
+            capability = issue_intent_capability(_intent_authority())
+            lookup = CapabilityLookup.from_capability(capability)
+            ledger = current_intent_capability_ledger()
+
+        # One ingress claim is single-use even if its Context was copied.
+        with activate_turn_authority(
+            session_id="session-1",
+            turn_id="turn-2",
+            platform="cli",
+            clean_user_message="ship G4",
+        ):
+            assert current_direct_user_receipt() is None
+        assert ledger.revalidate(capability, lookup) is False
+
+
+def test_direct_user_authority_copied_context_cannot_outlive_turn():
+    with bind_trusted_input(
+        origin=InputProvenance.DIRECT_USER_CLI,
+        session_id="session-1",
+        platform="cli",
+        source_identity="terminal-1",
+        clean_user_message="ship G4",
+    ):
+        with activate_turn_authority(
+            session_id="session-1",
+            turn_id="turn-1",
+            platform="cli",
+            clean_user_message="ship G4",
+        ):
+            capability = issue_intent_capability(_intent_authority())
+            lookup = CapabilityLookup.from_capability(capability)
+            ledger = current_intent_capability_ledger()
+            copied = copy_context()
+
+    assert copied.run(current_direct_user_receipt) is None
+    assert copied.run(ledger.revalidate, capability, lookup) is False
+
+
+def test_direct_user_authority_concurrent_sessions_do_not_leak():
+    def _worker(session_id):
+        message = f"message for {session_id}"
+        with bind_trusted_input(
+            origin=InputProvenance.DIRECT_USER_CLI,
+            session_id=session_id,
+            platform="cli",
+            source_identity=f"terminal-{session_id}",
+            clean_user_message=message,
+        ):
+            with activate_turn_authority(
+                session_id=session_id,
+                turn_id=f"turn-{session_id}",
+                platform="cli",
+                clean_user_message=message,
+            ):
+                capability = issue_intent_capability(_intent_authority())
+                receipt = current_direct_user_receipt()
+                assert receipt is not None
+                return receipt.session_id, capability.receipt.session_id
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(_worker, ("session-a", "session-b")))
+
+    assert results == [
+        ("session-a", "session-a"),
+        ("session-b", "session-b"),
+    ]
+    assert current_direct_user_receipt() is None
+
+
+def test_intent_capability_is_immutable_and_receipt_cannot_be_substituted():
+    with bind_trusted_input(
+        origin=InputProvenance.DIRECT_USER_CLI,
+        session_id="session-1",
+        platform="cli",
+        source_identity="terminal-1",
+        clean_user_message="ship G4",
+    ):
+        with activate_turn_authority(
+            session_id="session-1",
+            turn_id="turn-1",
+            platform="cli",
+            clean_user_message="ship G4",
+        ):
+            capability = issue_intent_capability(_intent_authority())
+            # CPython 3.13's slots+frozen dataclass path raises TypeError for
+            # assignment to a read-only property; older runtimes raise the
+            # more specific FrozenInstanceError. Both prove no mutation lands.
+            with pytest.raises((FrozenInstanceError, TypeError)):
+                capability.session_id = "forged"  # type: ignore[misc]
+            with pytest.raises(TypeError):
+                issue_intent_capability(  # type: ignore[call-arg]
+                    _intent_authority(), receipt=capability.receipt
+                )
+
+
+def test_direct_user_authority_does_not_change_prompt_or_message_bytes():
+    agent = _FakeAgent()
+    history = [{"role": "assistant", "content": "prior"}]
+    with bind_trusted_input(
+        origin=InputProvenance.DIRECT_USER_CLI,
+        session_id="sess-1",
+        platform="cli",
+        source_identity="terminal-1",
+        clean_user_message="hello",
+    ):
+        with activate_turn_authority(
+            session_id="sess-1",
+            turn_id="turn-1",
+            platform="cli",
+            clean_user_message="hello",
+        ):
+            ctx = _build(agent, conversation_history=history)
+
+    assert ctx.active_system_prompt == "SYSTEM"
+    assert ctx.messages == history + [{"role": "user", "content": "hello"}]
+
+
+def test_direct_user_authority_wraps_real_run_conversation_and_always_revokes():
+    from run_agent import AIAgent
+
+    class _WrapperAgent:
+        session_id = "session-1"
+        platform = "cli"
+        model = "test/model"
+        _session_db = None
+        _parent_session_id = None
+        _relay_pending_turn_id = None
+
+        @staticmethod
+        def _conversation_root_id():
+            return "session-1"
+
+    captured = {}
+
+    def _inner_run(agent, user_message, *_args, **_kwargs):
+        receipt = current_direct_user_receipt()
+        assert receipt is not None
+        captured["receipt"] = receipt
+        captured["ledger"] = current_intent_capability_ledger()
+        captured["capability"] = issue_intent_capability(_intent_authority())
+        captured["lookup"] = CapabilityLookup.from_capability(
+            captured["capability"]
+        )
+        return {"final_response": "ok", "messages": [], "completed": True}
+
+    coordinator = MagicMock()
+    coordinator.acquire_conversation.return_value = object()
+    coordinator.begin_turn.return_value = object()
+
+    with patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator), patch(
+        "agent.relay_runtime.current_profile_key", return_value="default"
+    ), patch(
+        "agent.conversation_loop.run_conversation", side_effect=_inner_run
+    ), patch(
+        "agent.aux_accounting.set_accounting_context", return_value=object()
+    ), patch(
+        "agent.aux_accounting.reset_accounting_context"
+    ), patch(
+        "agent.portal_tags.set_conversation_context", return_value=object()
+    ), patch(
+        "agent.portal_tags.reset_conversation_context"
+    ), patch(
+        "agent.subagent_lifecycle.bind_subagent_parent",
+        side_effect=lambda _agent: nullcontext(),
+    ), patch(
+        "agent.auxiliary_client.scoped_runtime_main",
+        side_effect=lambda _runtime: nullcontext(),
+    ), patch(
+        "hermes_cli.observability.relay_shared_metrics.start_task_run"
+    ), patch(
+        "hermes_cli.observability.relay_shared_metrics.finish_task_run"
+    ):
+        with bind_trusted_input(
+            origin=InputProvenance.DIRECT_USER_CLI,
+            session_id="session-1",
+            platform="cli",
+            source_identity="terminal-1",
+            clean_user_message="ship G4",
+        ):
+            result = AIAgent.run_conversation(_WrapperAgent(), "ship G4")
+
+    assert result["final_response"] == "ok"
+    assert captured["receipt"].session_id == "session-1"
+    assert captured["ledger"].revalidate(
+        captured["capability"], captured["lookup"]
+    ) is False
+    assert current_direct_user_receipt() is None

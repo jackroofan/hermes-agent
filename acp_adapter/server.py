@@ -1802,12 +1802,25 @@ class HermesACPAgent(acp.Agent):
             previous_session_id = os.environ.get("HERMES_SESSION_ID")
             os.environ["HERMES_SESSION_ID"] = session_id
             try:
-                result = agent.run_conversation(
-                    user_message=user_content,
-                    conversation_history=state.history,
-                    task_id=session_id,
-                    persist_user_message=user_text or "[Image attachment]",
+                from agent.intent_capability import (
+                    InputProvenance,
+                    bind_trusted_input,
                 )
+
+                _clean_user_message = user_text or "[Image attachment]"
+                with bind_trusted_input(
+                    origin=InputProvenance.DIRECT_USER_ACP,
+                    session_id=str(getattr(agent, "session_id", None) or session_id),
+                    platform="acp",
+                    source_identity=f"acp:{session_id}",
+                    clean_user_message=_clean_user_message,
+                ):
+                    result = agent.run_conversation(
+                        user_message=user_content,
+                        conversation_history=state.history,
+                        task_id=session_id,
+                        persist_user_message=_clean_user_message,
+                    )
                 return result
             except Exception as e:
                 logger.exception("Agent error in session %s", session_id)

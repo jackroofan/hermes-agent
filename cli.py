@@ -4192,6 +4192,47 @@ class _VoiceInputMessage:
         return self.text
 
 
+class _ClassifiedInputMessage:
+    """Private queue envelope for hidden, runtime-owned input provenance.
+
+    The payload is unwrapped before normal CLI processing, so prompt and
+    transcript bytes are unchanged.  Unwrapped/unknown queue entries are
+    deliberately non-authoritative; trusted enqueue sites must classify each
+    real user input explicitly.
+    """
+
+    __slots__ = ("_payload", "_provenance")
+
+    def __init__(self, payload, provenance) -> None:
+        object.__setattr__(self, "_payload", payload)
+        object.__setattr__(self, "_provenance", provenance)
+
+    @property
+    def payload(self):
+        return self._payload
+
+    @property
+    def provenance(self):
+        return self._provenance
+
+    def __setattr__(self, _name, _value) -> None:
+        raise AttributeError("classified input provenance is immutable")
+
+    def __str__(self) -> str:
+        return str(self.payload)
+
+    def __repr__(self) -> str:
+        return repr(self.payload)
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, _ClassifiedInputMessage):
+            return (
+                self.payload == other.payload
+                and self.provenance is other.provenance
+            )
+        return self.payload == other
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -7062,15 +7103,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return
 
         # Regular prompt: route through the same queues the Enter handler uses.
+        from agent.intent_capability import InputProvenance
+
+        classified = _ClassifiedInputMessage(
+            text, InputProvenance.DIRECT_USER_CLI
+        )
         if self._agent_running:
             # Agent busy → honour the configured busy-input behaviour by
             # queueing for the next turn (the safe default; interrupt/steer
             # remain reachable via the normal Enter path).
-            self._interrupt_queue.put(text) if self.busy_input_mode == "interrupt" else self._pending_input.put(text)
+            if self.busy_input_mode == "interrupt":
+                self._interrupt_queue.put(text)
+            else:
+                self._pending_input.put(classified)
             preview = text[:80] + ("..." if len(text) > 80 else "")
             _cprint(f"  Queued for the next turn: {preview}")
         else:
-            self._pending_input.put(text)
+            self._pending_input.put(classified)
 
         self._reset_input_buffer(buffer)
         if app is not None:
@@ -9989,7 +10038,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             retry_msg = self.retry_last()
             if retry_msg and hasattr(self, '_pending_input'):
                 # Re-queue the message so process_loop sends it to the agent
-                self._pending_input.put(retry_msg)
+                from agent.intent_capability import InputProvenance
+
+                self._pending_input.put(
+                    _ClassifiedInputMessage(
+                        retry_msg, InputProvenance.REPLAY_ONLY
+                    )
+                )
         elif canonical == "prompt":
             self._handle_prompt_compose_command(cmd_original)
         elif canonical == "undo":
@@ -10201,7 +10256,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if not payload:
                 _cprint("  Usage: /queue <prompt>")
             else:
-                self._pending_input.put(payload)
+                from agent.intent_capability import InputProvenance
+
+                self._pending_input.put(
+                    _ClassifiedInputMessage(payload, InputProvenance.SYNTHETIC)
+                )
                 if self._agent_running:
                     _cprint(f"  Queued for the next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
                 else:
@@ -10228,7 +10287,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         _cprint("  Steer rejected (empty payload).")
             else:
                 # No active run — treat as a normal next-turn message.
-                self._pending_input.put(payload)
+                from agent.intent_capability import InputProvenance
+
+                self._pending_input.put(
+                    _ClassifiedInputMessage(payload, InputProvenance.SYNTHETIC)
+                )
                 _cprint(f"  No agent running; queued as next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
         elif canonical == "goal":
             self._handle_goal_command(cmd_original)
@@ -10367,7 +10430,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             f"[yellow]Skipped missing skills: {', '.join(missing)}[/]"
                         )
                     if hasattr(self, '_pending_input'):
-                        self._pending_input.put(msg)
+                        from agent.intent_capability import InputProvenance
+
+                        self._pending_input.put(
+                            _ClassifiedInputMessage(
+                                msg, InputProvenance.SYNTHETIC
+                            )
+                        )
                 else:
                     ChatConsole().print(
                         f"[bold red]Failed to load bundle for {base_cmd}[/]"
@@ -10400,7 +10469,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 f"[yellow]Skipped missing skills: {', '.join(missing)}[/]"
                             )
                         if hasattr(self, '_pending_input'):
-                            self._pending_input.put(msg)
+                            from agent.intent_capability import InputProvenance
+
+                            self._pending_input.put(
+                                _ClassifiedInputMessage(
+                                    msg, InputProvenance.SYNTHETIC
+                                )
+                            )
                     else:
                         ChatConsole().print(
                             f"[bold red]Failed to load stacked skills for {base_cmd}[/]"
@@ -10414,7 +10489,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     skill_name = skill_commands[base_cmd]["name"]
                     print(f"\n⚡ Loading skill: {skill_name}")
                     if hasattr(self, '_pending_input'):
-                        self._pending_input.put(msg)
+                        from agent.intent_capability import InputProvenance
+
+                        self._pending_input.put(
+                            _ClassifiedInputMessage(
+                                msg, InputProvenance.SYNTHETIC
+                            )
+                        )
                 else:
                     ChatConsole().print(f"[bold red]Failed to load skill for {base_cmd}[/]")
             else:
@@ -10558,7 +10639,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
-            self._pending_input.put(synthetic_message)
+            from agent.intent_capability import InputProvenance
+
+            self._pending_input.put(
+                _ClassifiedInputMessage(
+                    synthetic_message, InputProvenance.BACKGROUND
+                )
+            )
             complete_event_delivery(event, claim)
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
@@ -10582,7 +10669,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             while not self._interrupt_queue.empty():
                 stray = self._interrupt_queue.get_nowait()
                 if stray:
-                    self._pending_input.put(stray)
+                    from agent.intent_capability import InputProvenance
+
+                    self._pending_input.put(
+                        _ClassifiedInputMessage(
+                            stray, InputProvenance.DIRECT_USER_CLI
+                        )
+                    )
         except Exception:
             pass  # Non-fatal — never break the main loop
 
@@ -10708,7 +10801,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             prompt = decision.get("continuation_prompt")
             if prompt:
                 try:
-                    self._pending_input.put(prompt)
+                    from agent.intent_capability import InputProvenance
+
+                    self._pending_input.put(
+                        _ClassifiedInputMessage(
+                            prompt, InputProvenance.SYNTHETIC
+                        )
+                    )
                 except Exception as exc:
                     logging.debug("goal continuation enqueue failed: %s", exc)
 
@@ -13552,6 +13651,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         Returns:
             The agent's response, or None on error
         """
+        from agent.intent_capability import InputProvenance
+
+        _turn_input_provenance = getattr(
+            self, "_next_turn_input_provenance", InputProvenance.UNCLASSIFIED
+        )
+        if not isinstance(_turn_input_provenance, InputProvenance):
+            _turn_input_provenance = InputProvenance.UNCLASSIFIED
+        self._next_turn_input_provenance = InputProvenance.UNCLASSIFIED
+
         # Single-query and direct chat callers do not go through run(), so
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
@@ -13868,14 +13976,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
                 self._pending_one_turn_model_restore = None
                 try:
-                    result = self.agent.run_conversation(
-                        user_message=agent_message,
-                        conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
-                        stream_callback=stream_callback,
-                        task_id=self.session_id,
-                        persist_user_message=_persist_clean_user_message,
-                        moa_config=_moa_cfg,
+                    from agent.intent_capability import (
+                        InputProvenance,
+                        bind_trusted_input,
                     )
+
+                    _authority_clean_message = (
+                        _persist_clean_user_message
+                        if _persist_clean_user_message is not None
+                        else agent_message
+                    )
+                    with bind_trusted_input(
+                        origin=_turn_input_provenance,
+                        session_id=str(getattr(self.agent, "session_id", None) or self.session_id or ""),
+                        platform="cli",
+                        source_identity=f"cli:{self.session_id or 'default'}",
+                        clean_user_message=_authority_clean_message,
+                    ):
+                        result = self.agent.run_conversation(
+                            user_message=agent_message,
+                            conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
+                            stream_callback=stream_callback,
+                            task_id=self.session_id,
+                            persist_user_message=_persist_clean_user_message,
+                            moa_config=_moa_cfg,
+                        )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
                         for _key, _value in _restore.items():
@@ -13971,7 +14096,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             # _pending_input so it runs as the next turn.
                             if self._clarify_state or self._clarify_freetext:
                                 try:
-                                    self._pending_input.put(interrupt_msg)
+                                    from agent.intent_capability import InputProvenance
+
+                                    self._pending_input.put(
+                                        _ClassifiedInputMessage(
+                                            interrupt_msg,
+                                            InputProvenance.DIRECT_USER_CLI,
+                                        )
+                                    )
                                 except Exception:
                                     pass
                                 interrupt_msg = None
@@ -14342,7 +14474,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     print(f"\n⚡ Sending {n} messages after interrupt: '{preview}'")
                 else:
                     print(f"\n⚡ Sending after interrupt: '{preview}'")
-                self._pending_input.put(combined)
+                from agent.intent_capability import InputProvenance
+
+                self._pending_input.put(
+                    _ClassifiedInputMessage(
+                        combined, InputProvenance.DIRECT_USER_CLI
+                    )
+                )
 
             # If a /steer was left over (agent finished before another tool
             # batch could absorb it), deliver it as the next user turn.
@@ -14350,7 +14488,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if _leftover_steer and hasattr(self, '_pending_input'):
                 preview = _leftover_steer[:60] + ("..." if len(_leftover_steer) > 60 else "")
                 print(f"\n⏩ Delivering leftover /steer as next turn: '{preview}'")
-                self._pending_input.put(_leftover_steer)
+                from agent.intent_capability import InputProvenance
+
+                self._pending_input.put(
+                    _ClassifiedInputMessage(
+                        _leftover_steer, InputProvenance.DIRECT_USER_CLI
+                    )
+                )
 
             return response
             
@@ -15290,7 +15434,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 _effective_mode = "queue"
                     if _effective_mode == "queue":
                         # Queue for the next turn instead of interrupting
-                        self._pending_input.put(payload)
+                        from agent.intent_capability import InputProvenance
+
+                        self._pending_input.put(
+                            _ClassifiedInputMessage(
+                                payload, InputProvenance.DIRECT_USER_CLI
+                            )
+                        )
                         preview = text if text else f"[{len(images)} image{'s' if len(images) != 1 else ''} attached]"
                         _cprint(f"  Queued for the next turn: {preview[:80]}{'...' if len(preview) > 80 else ''}")
                     elif _effective_mode == "interrupt":
@@ -15343,7 +15493,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     except Exception:
                         pass
                 else:
-                    self._pending_input.put(payload)
+                    from agent.intent_capability import InputProvenance
+
+                    self._pending_input.put(
+                        _ClassifiedInputMessage(
+                            payload, InputProvenance.DIRECT_USER_CLI
+                        )
+                    )
                 # History stores real pasted content, not the placeholder, so
                 # up-arrow recall restores the actual text.
                 self._inline_pastes(event.app.current_buffer)
@@ -17205,10 +17361,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 pass
                         continue
 
+                    from agent.intent_capability import InputProvenance
+
+                    _queued_input_provenance = InputProvenance.UNCLASSIFIED
+                    if isinstance(user_input, _ClassifiedInputMessage):
+                        if isinstance(user_input.provenance, InputProvenance):
+                            _queued_input_provenance = user_input.provenance
+                        user_input = user_input.payload
+
                     # Voice-transcribed messages arrive wrapped in a sentinel
                     # so only genuine STT output gets the voice prefix (#65827).
                     is_voice_input = isinstance(user_input, _VoiceInputMessage)
                     if is_voice_input:
+                        _queued_input_provenance = InputProvenance.DIRECT_USER_CLI
                         user_input = user_input.text
 
                     if not user_input:
@@ -17300,6 +17465,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         if _seed:
                             self._pending_agent_seed = None
                             user_input = _seed
+                            _queued_input_provenance = InputProvenance.SYNTHETIC
                         else:
                             continue
                     
@@ -17325,6 +17491,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
+                        self._next_turn_input_provenance = _queued_input_provenance
                         self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
                     finally:
                         self._agent_running = False
@@ -18250,10 +18417,22 @@ def main(
                         cli.agent.stream_delta_callback = None
                         cli.agent.tool_gen_callback = None
                         try:
-                            result = cli.agent.run_conversation(
-                                user_message=effective_query,
-                                conversation_history=cli.conversation_history,
+                            from agent.intent_capability import (
+                                InputProvenance,
+                                bind_trusted_input,
                             )
+
+                            with bind_trusted_input(
+                                origin=InputProvenance.DIRECT_USER_CLI,
+                                session_id=str(getattr(cli.agent, "session_id", None) or cli.session_id or ""),
+                                platform="cli",
+                                source_identity=f"cli:{cli.session_id or 'single-query'}",
+                                clean_user_message=effective_query,
+                            ):
+                                result = cli.agent.run_conversation(
+                                    user_message=effective_query,
+                                    conversation_history=cli.conversation_history,
+                                )
                         except KeyboardInterrupt:
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
                             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
@@ -18347,6 +18526,9 @@ def main(
                 # Surface security advisories before the agent runs — short
                 # banner, doesn't depend on the welcome banner being shown.
                 cli._show_security_advisories()
+                from agent.intent_capability import InputProvenance
+
+                cli._next_turn_input_provenance = InputProvenance.DIRECT_USER_CLI
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
         finally:

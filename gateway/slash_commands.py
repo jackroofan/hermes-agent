@@ -2596,6 +2596,8 @@ class GatewaySlashCommandsMixin:
             raw_message=event.raw_message,
             channel_prompt=event.channel_prompt,
         )
+        # Replaying old bytes through /retry is not a fresh user intent turn.
+        retry_event.replay_only = True
         
         # Let the normal message handler process it
         return await self._handle_message(retry_event)

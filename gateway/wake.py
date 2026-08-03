@@ -125,6 +125,7 @@ async def _self_post_chat_completion(
     url = f"http://{host}:{port}/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
+        "X-Hermes-Internal-Provenance": "background",
         "X-Hermes-Session-Id": session_id,
     }
     payload = {

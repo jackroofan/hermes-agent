@@ -2232,7 +2232,8 @@ from gateway.session_state import (
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
-from gateway.turn_context import TurnContext
+from agent.intent_capability import InputProvenance
+from gateway.turn_context import TurnContext, classify_input_provenance
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
@@ -5105,7 +5106,37 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            from agent.intent_capability import bind_trusted_input
+
+            _authority_clean_message = _conversation_kwargs.get(
+                "persist_user_message", _api_run_message
+            )
+            _authority_source_identity = json.dumps(
+                {
+                    "chat_id": str(ctx.source.chat_id or ""),
+                    "platform": platform_key,
+                    "profile": str(getattr(ctx.source, "profile", None) or ""),
+                    "session_key": str(ctx.session_key or ""),
+                    "thread_id": str(getattr(ctx.source, "thread_id", None) or ""),
+                    "user_id": str(ctx.source.user_id or ""),
+                    "user_id_alt": str(
+                        getattr(ctx.source, "user_id_alt", None) or ""
+                    ),
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            with bind_trusted_input(
+                origin=ctx.input_provenance,
+                session_id=str(getattr(agent, "session_id", None) or ctx.session_id or ""),
+                platform=platform_key,
+                source_identity=_authority_source_identity,
+                clean_user_message=_authority_clean_message,
+            ):
+                result = agent.run_conversation(
+                    _api_run_message, **_conversation_kwargs
+                )
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -16760,6 +16791,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                input_provenance=classify_input_provenance(event),
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -22849,6 +22881,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        input_provenance: InputProvenance = InputProvenance.UNCLASSIFIED,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -22862,6 +22895,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         agent runs on the host with full access to local files, memory,
         skills, and a unified session store.
         """
+        if not isinstance(input_provenance, InputProvenance):
+            input_provenance = InputProvenance.UNCLASSIFIED
         try:
             from aiohttp import ClientSession as _AioClientSession, ClientTimeout
         except ImportError:
@@ -22918,6 +22953,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             headers["Authorization"] = f"Bearer {proxy_key}"
         if session_id:
             headers["X-Hermes-Session-Id"] = session_id
+        if input_provenance not in {
+            InputProvenance.DIRECT_USER_GATEWAY,
+            InputProvenance.DIRECT_USER_API,
+        }:
+            headers["X-Hermes-Internal-Provenance"] = input_provenance.value
 
         body = {
             "model": "hermes-agent",
@@ -23129,6 +23169,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        input_provenance: InputProvenance = InputProvenance.UNCLASSIFIED,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -23148,6 +23189,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                input_provenance=input_provenance,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -23160,6 +23202,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                input_provenance=input_provenance,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -23282,6 +23325,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        input_provenance: InputProvenance = InputProvenance.UNCLASSIFIED,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -23295,6 +23339,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        if not isinstance(input_provenance, InputProvenance):
+            input_provenance = InputProvenance.UNCLASSIFIED
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
@@ -23306,6 +23352,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                input_provenance=input_provenance,
             )
 
         from run_agent import AIAgent
@@ -23526,6 +23573,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         turn_ctx = TurnContext(
             source=source,
+            input_provenance=input_provenance,
             _run_still_current=_run_still_current,
             _live_status_adapter=_live_status_adapter,
             _live_status_mode=_live_status_mode,
@@ -24642,6 +24690,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    input_provenance=classify_input_provenance(pending_event),
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

@@ -28,6 +28,52 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
 
+from agent.intent_capability import (
+    InputProvenance,
+    TRUSTED_DIRECT_USER_GATEWAY_PLATFORMS,
+)
+
+
+def classify_input_provenance(event: Any) -> InputProvenance:
+    """Classify a gateway event without granting authority by default.
+
+    Authorization and provenance are separate: this function is called only
+    after the gateway's existing auth checks for normal inbound messages, but
+    internal/replayed/bot/webhook/relay events remain non-authoritative even
+    when the gateway is allowed to process them.
+    """
+
+    if event is None:
+        return InputProvenance.UNCLASSIFIED
+    if bool(getattr(event, "internal", False)):
+        return InputProvenance.INTERNAL
+    if bool(getattr(event, "_hermes_startup_restore_replay", False)) or bool(
+        getattr(event, "replay_only", False)
+    ):
+        return InputProvenance.REPLAY_ONLY
+    if str(getattr(event, "text", "") or "").startswith(
+        "[Continuing toward your standing goal]\nGoal:"
+    ):
+        return InputProvenance.SYNTHETIC
+
+    source = getattr(event, "source", None)
+    if source is None:
+        return InputProvenance.UNCLASSIFIED
+    platform = getattr(source, "platform", None)
+    platform_value = str(getattr(platform, "value", platform) or "").lower()
+
+    if bool(getattr(source, "delivered_via_upstream_relay", False)) or platform_value == "relay":
+        return InputProvenance.RELAY
+    if platform_value in {"webhook", "msgraph_webhook"}:
+        return InputProvenance.WEBHOOK
+    if bool(getattr(source, "is_bot", False)):
+        return InputProvenance.SYNTHETIC
+    if platform_value == "api_server":
+        return InputProvenance.DIRECT_USER_API
+    if platform_value not in TRUSTED_DIRECT_USER_GATEWAY_PLATFORMS:
+        return InputProvenance.UNCLASSIFIED
+    return InputProvenance.DIRECT_USER_GATEWAY
+
 
 @dataclass
 class TurnContext:
@@ -35,6 +81,7 @@ class TurnContext:
 
     # --- read-only turn identity / wiring -------------------------------
     source: Any = None
+    input_provenance: InputProvenance = InputProvenance.UNCLASSIFIED
     _run_still_current: Callable[[], bool] = None  # type: ignore[assignment]
     _live_status_adapter: Any = None
     _live_status_mode: str = "off"

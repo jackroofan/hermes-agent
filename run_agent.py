@@ -7217,12 +7217,23 @@ class AIAgent:
                 getattr(self, "session_id", None),
             )
             from agent.auxiliary_client import scoped_runtime_main
+            from agent.intent_capability import activate_turn_authority
 
             # The outer token restores the caller's Context even though turn setup
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
-            with bind_subagent_parent(self), scoped_runtime_main({}):
+            _authority_clean_message = (
+                persist_user_message
+                if persist_user_message is not None
+                else user_message
+            )
+            with bind_subagent_parent(self), scoped_runtime_main({}), activate_turn_authority(
+                session_id=session_id,
+                turn_id=relay_turn_id,
+                platform=task_context["platform"],
+                clean_user_message=_authority_clean_message,
+            ):
                 result = run_conversation(
                     self,
                     user_message,

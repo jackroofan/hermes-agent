@@ -90,6 +90,7 @@ from gateway.platforms.base import (
     validate_media_delivery_path,
 )
 from agent.redact import redact_sensitive_text
+from agent.intent_capability import DIRECT_USER_PROVENANCE, InputProvenance
 from gateway.readiness import collect_runtime_readiness
 
 logger = logging.getLogger(__name__)
@@ -925,6 +926,34 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
 _api_agent_request_reservation: ContextVar[Optional[dict[str, bool]]] = ContextVar(
     "api_agent_request_reservation", default=None
 )
+_API_INTERNAL_PROVENANCE_HEADER = "X-Hermes-Internal-Provenance"
+_api_input_provenance: ContextVar[InputProvenance] = ContextVar(
+    "api_server_input_provenance", default=InputProvenance.UNCLASSIFIED
+)
+
+
+def _classify_api_input_provenance(request: Any) -> InputProvenance:
+    """Classify an authenticated API request; headers may only downgrade.
+
+    Normal API calls are direct-user ingress.  Hermes self-post/proxy paths
+    attach a non-user marker so their origin survives the HTTP hop.  A caller
+    can deny its own authority with this header, but direct-user values are
+    never accepted from the wire and therefore cannot elevate an input.
+    """
+
+    try:
+        raw = str(request.headers.get(_API_INTERNAL_PROVENANCE_HEADER, "") or "").strip()
+    except Exception:
+        return InputProvenance.UNCLASSIFIED
+    if not raw:
+        return InputProvenance.DIRECT_USER_API
+    try:
+        provenance = InputProvenance(raw)
+    except (TypeError, ValueError):
+        return InputProvenance.UNCLASSIFIED
+    if provenance in DIRECT_USER_PROVENANCE:
+        return InputProvenance.UNCLASSIFIED
+    return provenance
 
 
 def _admit_api_agent_request(handler):
@@ -947,6 +976,9 @@ def _admit_api_agent_request(handler):
             return draining
         reservation = {"active": True}
         token = _api_agent_request_reservation.set(reservation)
+        provenance_token = _api_input_provenance.set(
+            _classify_api_input_provenance(request)
+        )
         self._pending_agent_requests += 1
         try:
             return await handler(self, request, *args, **kwargs)
@@ -954,6 +986,7 @@ def _admit_api_agent_request(handler):
             if reservation["active"]:
                 reservation["active"] = False
                 self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
+            _api_input_provenance.reset(provenance_token)
             _api_agent_request_reservation.reset(token)
 
     return _wrapped
@@ -5805,6 +5838,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
+        input_provenance = _api_input_provenance.get()
+        if not isinstance(input_provenance, InputProvenance):
+            input_provenance = InputProvenance.UNCLASSIFIED
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -5834,11 +5870,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     effective_task_id = session_id or str(uuid.uuid4())
-                    result = agent.run_conversation(
-                        user_message=user_message,
-                        conversation_history=conversation_history,
-                        task_id=effective_task_id,
-                    )
+                    from agent.intent_capability import bind_trusted_input
+
+                    with bind_trusted_input(
+                        origin=input_provenance,
+                        session_id=str(getattr(agent, "session_id", None) or effective_task_id),
+                        platform="api_server",
+                        source_identity=str(gateway_session_key or session_id or effective_task_id),
+                        clean_user_message=user_message,
+                    ):
+                        result = agent.run_conversation(
+                            user_message=user_message,
+                            conversation_history=conversation_history,
+                            task_id=effective_task_id,
+                        )
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -6217,6 +6262,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
+        input_provenance = _api_input_provenance.get()
+        if not isinstance(input_provenance, InputProvenance):
+            input_provenance = InputProvenance.UNCLASSIFIED
 
         async def _run_and_close():
             try:
@@ -6308,11 +6356,20 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_id=session_id or "",
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
-                            r = agent.run_conversation(
-                                user_message=user_message,
-                                conversation_history=conversation_history,
-                                task_id=effective_task_id,
-                            )
+                            from agent.intent_capability import bind_trusted_input
+
+                            with bind_trusted_input(
+                                origin=input_provenance,
+                                session_id=str(getattr(agent, "session_id", None) or effective_task_id),
+                                platform="api_server",
+                                source_identity=str(approval_session_key or effective_task_id),
+                                clean_user_message=user_message,
+                            ):
+                                r = agent.run_conversation(
+                                    user_message=user_message,
+                                    conversation_history=conversation_history,
+                                    task_id=effective_task_id,
+                                )
                         finally:
                             try:
                                 unregister_gateway_notify(approval_session_key)
